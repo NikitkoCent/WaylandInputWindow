@@ -1,4 +1,4 @@
-#include "utilities.h"      // logging::*, MY_LOG_*
+#include "utilities.h"      // WLResourceWrapper, makeWLResourceWrapperChecked, logging::*, MY_LOG_*
 #include <wayland-client.h> // wl_*
 
 
