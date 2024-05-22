@@ -7,7 +7,10 @@ project(WaylandInputWindow
 
 find_package(Threads REQUIRED)
 
-add_executable(WaylandInputWindow main.cpp)
+add_executable(WaylandInputWindow
+    main.cpp
+    utilities.h
+)
 
 set_target_properties(WaylandInputWindow PROPERTIES
     CXX_STANDARD 17
@@ -23,6 +26,10 @@ if ((CMAKE_CXX_COMPILER_ID STREQUAL "Clang") OR (CMAKE_CXX_COMPILER_ID STREQUAL 
         PRIVATE -Werror      # treat all warnings as errors
     )
 endif()
+
+target_compile_definitions(WaylandInputWindow
+    PRIVATE "CMAKE_PROJECT_PATH=\"${PROJECT_SOURCE_DIR}\""
+)
 
 # TODO:
 # 1. Find the wayland-client library
