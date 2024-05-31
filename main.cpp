@@ -2,34 +2,52 @@
 #include <wayland-client.h> // wl_*
 
 
+/** Holds the whole state required for the app functioning */
+struct WLAppCtx
+{
+    WLResourceWrapper<wl_display*> connection;
+    WLResourceWrapper<wl_registry*> registry;
+
+    ~WLAppCtx() noexcept
+    {
+        // Keeping the correct order of the resources disposal
+
+        registry.reset();
+        connection.reset();
+    }
+};
+
+
 int main(int, char*[])
 {
     try
     {
+        WLAppCtx appCtx;
+
         // ========================== Step 1: make a connection to the Wayland server/compositor ======================
-        const WLResourceWrapper<wl_display*> display = makeWLResourceWrapperChecked(
+        appCtx.connection = makeWLResourceWrapperChecked(
             MY_LOG_WLCALL(wl_display_connect(nullptr)),
             nullptr,
             [](auto& dsp) { MY_LOG_WLCALL(wl_display_disconnect(dsp)); dsp = nullptr; }
         );
-        if (!display.hasResource())
+        if (!appCtx.connection.hasResource())
             throw std::system_error(errno, std::system_category(), "Failed to connect to a Wayland compositor");
 
-        const int displayFd = MY_LOG_WLCALL(wl_display_get_fd(*display));
-        MY_LOG_INFO("The Wayland connection fd: ", displayFd, '.');
+        const int connectionFd = MY_LOG_WLCALL(wl_display_get_fd(*appCtx.connection));
+        MY_LOG_INFO("The Wayland connection fd: ", connectionFd, '.');
         // ================================================ END of step 1 =============================================
 
         // == Step 2: create and listen to a registry object to track any dynamic changes in the server configuration =
-        const WLResourceWrapper<wl_registry*> registry = makeWLResourceWrapperChecked(
-            MY_LOG_WLCALL(wl_display_get_registry(*display)),
+        appCtx.registry = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(wl_display_get_registry(*appCtx.connection)),
             nullptr,
             [](auto& rgs) { MY_LOG_WLCALL(wl_registry_destroy(rgs)); rgs = nullptr; }
         );
-        if (*registry == nullptr)
+        if (!appCtx.registry.hasResource())
             throw std::system_error(errno, std::system_category(), "Failed to obtain the registry global object");
 
         // TODO: why does it return 0?
-        MY_LOG_INFO("The registry version: ", MY_LOG_WLCALL(wl_registry_get_version(*registry)));
+        MY_LOG_INFO("The registry version: ", MY_LOG_WLCALL(wl_registry_get_version(*appCtx.registry)));
 
         struct {
             static void onGlobalEvent(void *data, wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
@@ -57,7 +75,7 @@ int main(int, char*[])
             const wl_registry_listener wlHandler = { &onGlobalEvent, &onGlobalRemoveEvent };
         } registryListener;
 
-        if (const auto err = MY_LOG_WLCALL(wl_registry_add_listener(*registry, &registryListener.wlHandler, &registryListener)); err != 0)
+        if (const auto err = MY_LOG_WLCALL(wl_registry_add_listener(*appCtx.registry, &registryListener.wlHandler, &registryListener)); err != 0)
             throw std::system_error(
                 errno,
                 std::system_category(),
@@ -69,7 +87,7 @@ int main(int, char*[])
         //   the replies/events from the server.
         // This way we'll get all the initial wl_registry::global events, hence get aware about all the currently
         //   available global objects on the server.
-        if (const auto err = MY_LOG_WLCALL(wl_display_roundtrip(*display)); err < 0)
+        if (const auto err = MY_LOG_WLCALL(wl_display_roundtrip(*appCtx.connection)); err < 0)
             throw std::system_error(
                 errno,
                 std::system_category(),
