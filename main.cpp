@@ -23,6 +23,9 @@ struct WLAppCtx
     };
     std::unordered_map<uint32_t /* name */, WLGlobalObjectInfo> availableGlobalObjects;
 
+    /** Responsible for creation of surfaces and regions */
+    WLResourceWrapper<wl_compositor*> compositor;
+
 
     ~WLAppCtx() noexcept
     {
@@ -174,6 +177,54 @@ int main(int, char*[])
                 std::system_category(),
                 "wl_display_roundtrip failed (returned " + std::to_string(err) + ")"
             );
+
+        // ================ Step 3: binding to the wl_compositor global to be able to create surfaces =================
+        MY_LOG_INFO("wl_compositor version supported by this client: ", wl_compositor_interface.version, '.');
+        for (auto& [name, objInfo] : appCtx.availableGlobalObjects)
+        {
+            if (objInfo.interface == wl_compositor_interface.name)
+            {
+                appCtx.compositor = makeWLResourceWrapperChecked(
+                    static_cast<wl_compositor*>(MY_LOG_WLCALL(wl_registry_bind(
+                        *appCtx.registry,
+                        name,
+                        &wl_compositor_interface,
+                        wl_compositor_interface.version
+                    ))),
+                    nullptr,
+                    [](auto& cmps) { MY_LOG_WLCALL(wl_compositor_destroy(cmps)); cmps = nullptr; }
+                );
+                if (!appCtx.compositor.hasResource())
+                    throw std::system_error(errno, std::system_category(), "Failed to bind to the wl_compositor");
+
+                objInfo.bindedVersion = wl_compositor_interface.version;
+
+                break;
+            }
+        }
+        if (!appCtx.compositor.hasResource())
+        {
+            MY_LOG_ERROR("Couldn't find a wl_compositor on the Wayland server, shutting down...");
+            return 4;
+        }
+
+        registryListener.addOnGlobalEventAppListener([](uint32_t name, std::string_view interface, uint32_t version, const WLAppCtx& appCtx) {
+            if (interface != wl_compositor_interface.name)
+                return;
+
+            MY_LOG_WARN("A new wl_compositor object has dynamically become available ; name=", name, ", version=", version);
+            // TODO: handle this case
+            (void)name; (void)version; (void)appCtx;
+        });
+        registryListener.addOnGlobalRemoveEventAppListener([](uint32_t name, const WLAppCtx::WLGlobalObjectInfo& info, const WLAppCtx& appCtx) {
+            if (info.interface != wl_compositor_interface.name)
+                return;
+
+            MY_LOG_ERROR("A wl_compositor global object with name=", name, " has been removed from the server. This case isn't supported yet.");
+            // TODO: handle this case
+            (void)name; (void)info; (void)appCtx;
+        });
+        // ============================================== END of Step 3 ===============================================
     }
     catch (const std::system_error& err)
     {
