@@ -6,6 +6,7 @@
 #include <optional>         // std::optional
 #include <vector>           // std::vector
 #include <utility>          // std::move
+#include <limits>           // std::numeric_limits
 
 
 /** Holds the whole state required for the app functioning */
@@ -26,12 +27,93 @@ struct WLAppCtx
     /** Responsible for creation of surfaces and regions */
     WLResourceWrapper<wl_compositor*> compositor;
 
+    WLResourceWrapper<wl_shm*> shmProvider;
+
+    struct
+    {
+        const std::size_t width  = 800;
+        const std::size_t height = 600;
+        // XRGB8888 is used
+        const std::size_t bytesPerPixel = 4;
+
+        SharedMemoryBuffer surfaceSharedBuffer;
+        WLResourceWrapper<wl_shm_pool*> surfaceBufferWLPool;
+        WLResourceWrapper<wl_buffer*> surfaceWLSideBuffer1;
+        WLResourceWrapper<wl_buffer*> surfaceWLSideBuffer2;
+        /* 0 for surfaceWLSideBuffer1, 1 for surfaceWLSideBuffer2 */
+        unsigned pendingBufferIdx = 0;
+
+        [[nodiscard]] std::size_t getSurfaceBufferOffsetForIdx(unsigned idx) const noexcept
+        {
+            return idx * width * bytesPerPixel * height;
+        }
+        [[nodiscard]] std::size_t getSurfaceBufferPendingOffset() const noexcept
+        {
+            return getSurfaceBufferOffsetForIdx(pendingBufferIdx);
+        }
+        [[nodiscard]] wl_buffer* getPendingWLSideBuffer() const
+        {
+            return (pendingBufferIdx == 0) ? surfaceWLSideBuffer1.getResource() : surfaceWLSideBuffer2.getResource();
+        }
+
+        template<typename Visitor>
+        void drawVia(
+            Visitor&& v,
+            const std::size_t rectX = 0,
+            const std::size_t rectY = 0,
+            std::size_t rectWidth = std::numeric_limits<std::size_t>::max(),
+            std::size_t rectHeight = std::numeric_limits<std::size_t>::max()
+        ) {
+            MY_LOG_TRACE("mainWindow::drawVia: drawing into ", (pendingBufferIdx == 0) ? "1st" : "2nd", " buffer...");
+
+            if ( (rectX >= 0 + width) || (rectY >= 0 + height) )
+            {
+                return;
+            }
+            rectWidth  = std::clamp<std::size_t>(rectWidth,  0, 0 + width  - rectX);
+            rectHeight = std::clamp<std::size_t>(rectHeight, 0, 0 + height - rectY);
+            const auto rectXMax = rectX + rectWidth;
+            const auto rectYMax = rectY + rectHeight;
+
+            const auto bufferToWriteOffset = getSurfaceBufferPendingOffset();
+
+            for (std::size_t y = rectY; y < rectYMax; ++y)
+            {
+                const std::size_t rowOffset = bufferToWriteOffset + y * width * bytesPerPixel;
+
+                for (std::size_t x = rectX; x < rectXMax; ++x)
+                {
+                    const std::size_t pixelOffset = rowOffset + x * bytesPerPixel;
+
+                    // XRGB8888 format
+                    std::byte& b = surfaceSharedBuffer[pixelOffset + 0];
+                    std::byte& g = surfaceSharedBuffer[pixelOffset + 1];
+                    std::byte& r = surfaceSharedBuffer[pixelOffset + 2];
+                    std::byte& a = surfaceSharedBuffer[pixelOffset + 3];
+
+                    std::forward<Visitor>(v)(x, y, b, g, r);
+                    a = std::byte{ 0xFF };
+                }
+            }
+        }
+
+        WLResourceWrapper<wl_surface*> surface;
+    } mainWindow;
+
 
     ~WLAppCtx() noexcept
     {
         // Keeping the correct order of the resources disposal
 
+        mainWindow.surface.reset();
+        mainWindow.surfaceWLSideBuffer2.reset();
+        mainWindow.surfaceWLSideBuffer1.reset();
+        mainWindow.surfaceBufferWLPool.reset();
+        mainWindow.surfaceSharedBuffer.dispose();
+
         availableGlobalObjects.clear();
+        shmProvider.reset();
+        compositor.reset();
         registry.reset();
         connection.reset();
     }
@@ -225,6 +307,117 @@ int main(int, char*[])
             (void)name; (void)info; (void)appCtx;
         });
         // ============================================== END of Step 3 ===============================================
+
+        // ============================== Step 4: creating a surface for the main window ==============================
+
+        // The surface will be using Wayland's shared memory buffers for holding the surface pixels.
+        // This feature is provided by wl_shm global object(s). So firstly we have to bind to it.
+        MY_LOG_INFO("Looking up a wl_shm global object, the version supported by this client: ", wl_shm_interface.version, "...");
+        for (auto& [name, objInfo] : appCtx.availableGlobalObjects)
+        {
+            if (objInfo.interface == wl_shm_interface.name)
+            {
+                MY_LOG_INFO("    ... Found a wl_shm object with name=", name, ", binding...");
+
+                const auto versionToBind = wl_shm_interface.version;
+
+                appCtx.shmProvider = makeWLResourceWrapperChecked(
+                    static_cast<wl_shm*>(MY_LOG_WLCALL(wl_registry_bind(
+                        appCtx.registry.getResource(),
+                        name,
+                        &wl_shm_interface,
+                        versionToBind
+                    ))),
+                    nullptr,
+                    [](auto& shm) { MY_LOG_WLCALL(wl_shm_destroy(shm)); shm = nullptr; }
+                );
+                if (!appCtx.shmProvider.hasResource())
+                    throw std::system_error(errno, std::system_category(), "Failed to bind to the wl_shm");
+
+                objInfo.bindedVersion = versionToBind;
+
+                break;
+            }
+        }
+        if (!appCtx.shmProvider.hasResource())
+        {
+            MY_LOG_ERROR("Couldn't find a wl_shm object on the Wayland server, shutting down...");
+            return 5;
+        }
+
+        // Next, we have to allocate a shared memory buffer (POSIX's shm_* + mmap APIs).
+        // We're going to write pixels into it, and then the server will read from it.
+        // The space is multiplied by 2 because the double buffering technique is going to be used to avoid
+        //   flickering issues.
+        // appCtx.mainWindow.currentlyUsedBufferIdx will be holding the index of the buffer which is currently being
+        //   read by the server.
+        appCtx.mainWindow.surfaceSharedBuffer = SharedMemoryBuffer::allocate(
+            appCtx.mainWindow.width * appCtx.mainWindow.bytesPerPixel * appCtx.mainWindow.height * 2
+        );
+
+        // Now, share the whole buffer with the server so it gets able to use it
+        appCtx.mainWindow.surfaceBufferWLPool = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(wl_shm_create_pool(
+                *appCtx.shmProvider,
+                appCtx.mainWindow.surfaceSharedBuffer.getFd(),
+                appCtx.mainWindow.surfaceSharedBuffer.getSize()
+            )),
+            nullptr,
+            [](auto& shmPool) { MY_LOG_WLCALL(wl_shm_pool_destroy(shmPool)); shmPool = nullptr; }
+        );
+        if (!appCtx.mainWindow.surfaceBufferWLPool.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create a wl_shm_pool for the main window");
+
+        // Separate the buffer into 2 Wayland sub-buffers (for the double-buffering)
+        appCtx.mainWindow.surfaceWLSideBuffer1 = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(wl_shm_pool_create_buffer(
+                *appCtx.mainWindow.surfaceBufferWLPool,
+                appCtx.mainWindow.getSurfaceBufferOffsetForIdx(0),
+                appCtx.mainWindow.width,
+                appCtx.mainWindow.height,
+                appCtx.mainWindow.width * appCtx.mainWindow.bytesPerPixel,
+                WL_SHM_FORMAT_XRGB8888
+            )),
+            nullptr,
+            [](auto& buf) { MY_LOG_WLCALL(wl_buffer_destroy(buf)); buf = nullptr; }
+        );
+        if (!appCtx.mainWindow.surfaceWLSideBuffer1.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create 1st wl_buffer for the main window");
+
+        appCtx.mainWindow.surfaceWLSideBuffer2 = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(wl_shm_pool_create_buffer(
+                *appCtx.mainWindow.surfaceBufferWLPool,
+                appCtx.mainWindow.getSurfaceBufferOffsetForIdx(1),
+                appCtx.mainWindow.width,
+                appCtx.mainWindow.height,
+                appCtx.mainWindow.width * appCtx.mainWindow.bytesPerPixel,
+                WL_SHM_FORMAT_XRGB8888
+            )),
+            nullptr,
+            [](auto& buf) { MY_LOG_WLCALL(wl_buffer_destroy(buf)); buf = nullptr; }
+        );
+        if (!appCtx.mainWindow.surfaceWLSideBuffer2.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create 2nd wl_buffer for the main window");
+
+        // Creating a surface
+        appCtx.mainWindow.surface = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(wl_compositor_create_surface(appCtx.compositor.getResource())),
+            nullptr,
+            [](auto& srf) { MY_LOG_WLCALL(wl_surface_destroy(srf)); srf = nullptr; }
+        );
+        if (!appCtx.mainWindow.surface.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create a wl_surface for the main window");
+
+        // Initially attaching the first buffer to the surface
+        MY_LOG_WLCALL_VALUELESS(wl_surface_attach(*appCtx.mainWindow.surface, appCtx.mainWindow.getPendingWLSideBuffer(), 0, 0));
+
+        // Initializing the buffer with the "silver" (#C0C0C0) color
+        appCtx.mainWindow.drawVia([](std::size_t /*x*/, std::size_t /*y*/, std::byte& b, std::byte& g, std::byte& r) {
+            b = g = r = std::byte{0xC0};
+        });
+        // Letting the server know that it should re-render the whole buffer
+        MY_LOG_WLCALL_VALUELESS(wl_surface_damage_buffer(*appCtx.mainWindow.surface, 0, 0, appCtx.mainWindow.width, appCtx.mainWindow.height));
+        // ============================================== END of Step 4 ===============================================
     }
     catch (const std::system_error& err)
     {

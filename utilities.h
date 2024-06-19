@@ -5,6 +5,7 @@
 #include <utility>          // std::move, std::forward, std::pair
 #include <optional>         // std::optional
 #include <functional>       // std::function
+#include <string>           // std::to_string
 #include <string_view>      // std::string_view
 #include <chrono>           // std::chrono::*
 #include <ctime>            // std::localtime, std::strftime
@@ -13,7 +14,13 @@
 #include <iomanip>          // std::setfill, std::setw, std::hex, std::setbase, std::left, std::right
 #include <sstream>          // std::ostringstream
 #include <cstdio>           // std::snprintf
+#include <cstddef>          // std::byte, std::size_t
 #include <cerrno>           // errno
+#include <random>           // std::random_device, std::mt19937, std::uniform_int_distribution
+#include <sys/mman.h>       // shm_open, shm_unlink
+#include <sys/stat.h>       // S_IREAD, S_IWRITE
+#include <fcntl.h>          // O_CREAT, O_EXCL, O_RDWR
+#include <unistd.h>         // close
 
 
 template<typename T>
@@ -121,6 +128,164 @@ WLResourceWrapper< std::decay_t<T> > makeWLResourceWrapperChecked(T&& resource, 
 
     return { std::forward<T>(resource) };
 }
+
+
+/** RAII wrapper for shm_open + shm_unlink + mmap -> close  */
+class SharedMemoryBuffer
+{
+public: // ctors/dtor
+    [[nodiscard]] static SharedMemoryBuffer allocate(std::size_t bufferSize) noexcept(false)
+    {
+        int shmFd = -1;
+        std::string shmFilename;
+
+        std::mt19937 prd(std::random_device{}());
+        std::uniform_int_distribution<> distrib;
+
+        // 1. shm_open
+        for (int i = 0; i < 100; ++i)
+        {
+            shmFilename = "/wl_shm-WaylandInputWindow-" + std::to_string(distrib(prd));
+
+            shmFd = shm_open(shmFilename.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IREAD | S_IWRITE);
+            if (shmFd != -1)
+                break;
+            if (errno != EEXIST)
+                throw std::system_error(errno, std::system_category(), "shm_open failed");
+
+            break;
+        }
+        if (shmFd == -1)
+            throw std::runtime_error("shm_open has failed too many times");
+
+        // 2. shm_unlink
+        if (const auto retVal = shm_unlink(shmFilename.c_str()); retVal != 0)
+        {
+            const auto savedErrno = errno;
+            close(shmFd);
+            throw std::system_error(savedErrno, std::system_category(),
+                                    "shm_unlink failed (returned " + std::to_string(retVal) + ")");
+        }
+
+        // 3. ftruncate
+        for (int i = 0; i < 100; ++i)
+        {
+            const auto truncResult = ftruncate(shmFd, bufferSize);
+
+            if (truncResult == 0)
+                break;
+
+            if (errno != EINTR)
+            {
+                const auto savedErrno = errno;
+                close(shmFd);
+                throw std::system_error(savedErrno, std::system_category(),
+                                        "ftruncate failed (returned " + std::to_string(truncResult) + ")");
+            }
+        }
+
+        // 4. mmap
+        auto mmappedAddr = mmap(nullptr, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+        if ((mmappedAddr == MAP_FAILED) || (mmappedAddr == nullptr))
+        {
+            const auto savedErrno = errno;
+            close(shmFd);
+            throw std::system_error(savedErrno, std::system_category(), "mmap failed");
+        }
+
+        return { shmFd, static_cast<std::byte*>(mmappedAddr), bufferSize };
+    }
+
+    // isValid() == false
+    SharedMemoryBuffer() noexcept
+        : SharedMemoryBuffer(-1, nullptr, 0)
+    {}
+
+    SharedMemoryBuffer(const SharedMemoryBuffer&) = delete;
+    SharedMemoryBuffer(SharedMemoryBuffer&& src) noexcept
+        : shmFd_{src.shmFd_}
+    , mmappedAddr_(src.mmappedAddr_)
+    , bufferSize_(src.bufferSize_)
+    {
+        src.shmFd_ = -1;
+        src.mmappedAddr_ = nullptr;
+        src.bufferSize_ = 0;
+    }
+
+    ~SharedMemoryBuffer() noexcept
+    {
+        dispose();
+    }
+
+public: // assignments
+    SharedMemoryBuffer& operator=(const SharedMemoryBuffer&) = delete;
+    SharedMemoryBuffer& operator=(SharedMemoryBuffer&& rhs) noexcept
+    {
+        if (this != &rhs)
+        {
+            std::swap(shmFd_, rhs.shmFd_);
+            std::swap(mmappedAddr_, rhs.mmappedAddr_);
+            std::swap(bufferSize_, rhs.bufferSize_);
+        }
+
+        return *this;
+    }
+
+public: // getters
+    [[nodiscard]] bool isValid() const noexcept { return ( (shmFd_ != -1) && (mmappedAddr_ != nullptr) ); }
+
+    [[nodiscard]] int getFd() const noexcept { return shmFd_; }
+
+    [[nodiscard]] std::byte* getData() noexcept { return mmappedAddr_; }
+    [[nodiscard]] const std::byte* getData() const noexcept { return mmappedAddr_; }
+
+    [[nodiscard]] std::byte& operator[](std::size_t idx) { return mmappedAddr_[idx]; }
+    [[nodiscard]] const std::byte& operator[](std::size_t idx) const { return mmappedAddr_[idx]; }
+
+    [[nodiscard]] std::size_t getSize() const noexcept { return bufferSize_; }
+
+public:
+    void sync(bool invalidateOthers = true) noexcept(false) { return sync(invalidateOthers, 0, getSize()); }
+
+    void sync(bool invalidateOthers, std::size_t offset, std::size_t size) noexcept(false)
+    {
+        if (!isValid())
+            throw std::logic_error("SharedMemoryBuffer::sync: this->isValid() == false");
+
+        const auto retVal = msync(mmappedAddr_ + offset, size, MS_SYNC | (invalidateOthers ? 0 : MS_INVALIDATE));
+        if (retVal != 0)
+            throw std::system_error(errno, std::system_category(),
+                                    "SharedMemoryBuffer::sync: msync failed (returned " + std::to_string(retVal) + ")");
+    }
+
+    void dispose()
+    {
+        if (mmappedAddr_ != nullptr)
+        {
+            (void)munmap(mmappedAddr_, bufferSize_);
+            mmappedAddr_ = nullptr;
+        }
+        bufferSize_ = 0;
+
+        if (shmFd_ != -1)
+        {
+            (void)close(shmFd_);
+            shmFd_ = -1;
+        }
+    }
+
+private:
+    SharedMemoryBuffer(int shmFd, std::byte* mmappedAddr, std::size_t bufferSize) noexcept
+        : shmFd_{shmFd}
+        , mmappedAddr_{mmappedAddr}
+        , bufferSize_{bufferSize}
+    {}
+
+private:
+    int shmFd_;
+    std::byte* mmappedAddr_;
+    std::size_t bufferSize_;
+};
 
 
 namespace logging {
