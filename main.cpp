@@ -1,5 +1,6 @@
 #include "utilities.h"      // WLResourceWrapper, makeWLResourceWrapperChecked, logging::*, MY_LOG_*
 #include <wayland-client.h> // wl_*
+#include <xdg-shell.h>      // xdg_*
 #include <string>           // std::string
 #include <string_view>      // std::string_view
 #include <unordered_map>    // std::unordered_map
@@ -28,6 +29,10 @@ struct WLAppCtx
     WLResourceWrapper<wl_compositor*> compositor;
 
     WLResourceWrapper<wl_shm*> shmProvider;
+
+    // The entry point to the XDG shell protocol, responsible for assigning window roles to wl_surface instances
+    //   and making them able to be dragged, resized, maximized, etc
+    WLResourceWrapper<xdg_wm_base*> xdgShell;
 
     struct
     {
@@ -98,6 +103,9 @@ struct WLAppCtx
         }
 
         WLResourceWrapper<wl_surface*> surface;
+
+        WLResourceWrapper<xdg_surface*> xdgSurface;
+        WLResourceWrapper<xdg_toplevel*> xdgToplevel;
     } mainWindow;
 
 
@@ -105,6 +113,8 @@ struct WLAppCtx
     {
         // Keeping the correct order of the resources disposal
 
+        mainWindow.xdgToplevel.reset();
+        mainWindow.xdgSurface.reset();
         mainWindow.surface.reset();
         mainWindow.surfaceWLSideBuffer2.reset();
         mainWindow.surfaceWLSideBuffer1.reset();
@@ -112,6 +122,7 @@ struct WLAppCtx
         mainWindow.surfaceSharedBuffer.dispose();
 
         availableGlobalObjects.clear();
+        xdgShell.reset();
         shmProvider.reset();
         compositor.reset();
         registry.reset();
@@ -418,6 +429,61 @@ int main(int, char*[])
         // Letting the server know that it should re-render the whole buffer
         MY_LOG_WLCALL_VALUELESS(wl_surface_damage_buffer(*appCtx.mainWindow.surface, 0, 0, appCtx.mainWindow.width, appCtx.mainWindow.height));
         // ============================================== END of Step 4 ===============================================
+
+        // ============ Step 5: assigning the role to the main window surface using the XDG shell protocol ============
+
+        // First, binding to the xdg_wm_base global object
+        MY_LOG_INFO("Looking up a xdg_wm_base global object, the version supported by this client: ", xdg_wm_base_interface.version, "...");
+        for (auto& [name, objInfo] : appCtx.availableGlobalObjects)
+        {
+            if (objInfo.interface == xdg_wm_base_interface.name)
+            {
+                const auto versionToBind = xdg_wm_base_interface.version;
+
+                MY_LOG_INFO("    ... Found a xdg_wm_base object with name=", name, ", binding to version ", versionToBind, "...");
+
+                appCtx.xdgShell = makeWLResourceWrapperChecked(
+                    static_cast<xdg_wm_base*>(MY_LOG_WLCALL(wl_registry_bind(
+                        appCtx.registry.getResource(),
+                        name,
+                        &xdg_wm_base_interface,
+                        versionToBind
+                    ))),
+                    nullptr,
+                    [](auto& xdgShell) { MY_LOG_WLCALL(xdg_wm_base_destroy(xdgShell)); xdgShell = nullptr; }
+                );
+
+                if (!appCtx.xdgShell.hasResource())
+                    throw std::system_error(errno, std::system_category(), "Failed to bind to the xdg_wm_base");
+
+                objInfo.bindedVersion = versionToBind;
+
+                break;
+            }
+        }
+
+        // Creating an xdg_surface from the main window's wl_surface
+        appCtx.mainWindow.xdgSurface = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(xdg_wm_base_get_xdg_surface(*appCtx.xdgShell, *appCtx.mainWindow.surface)),
+            nullptr,
+            [](auto& xdgSurface) { MY_LOG_WLCALL(xdg_surface_destroy(xdgSurface)); xdgSurface = nullptr; }
+        );
+        if (!appCtx.mainWindow.xdgSurface.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create an xdg_surface for the main window");
+
+        // Assigning the toplevel role to the main window via creating a xdg_toplevel from its xdg_surface
+        appCtx.mainWindow.xdgToplevel = makeWLResourceWrapperChecked(
+            MY_LOG_WLCALL(xdg_surface_get_toplevel(*appCtx.mainWindow.xdgSurface)),
+            nullptr,
+            [](auto& xdgToplevel) { MY_LOG_WLCALL(xdg_toplevel_destroy(xdgToplevel)); xdgToplevel = nullptr; }
+        );
+        if (!appCtx.mainWindow.xdgToplevel.hasResource())
+            throw std::system_error(errno, std::system_category(), "Failed to create an xdg_toplevel for the main window");
+
+        // Setting the main window title
+        MY_LOG_WLCALL_VALUELESS(xdg_toplevel_set_title(*appCtx.mainWindow.xdgToplevel, "WaylandInputWindow"));
+
+        // ============================================== END of Step 5 ===============================================
     }
     catch (const std::system_error& err)
     {
