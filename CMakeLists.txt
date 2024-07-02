@@ -1,11 +1,20 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.19)
+
 
 project(WaylandInputWindow
     HOMEPAGE_URL "https://github.com/NikitkoCent/WaylandInputWindow"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
+
+# All the required packages
 find_package(Threads REQUIRED)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+find_package(Wayland REQUIRED
+    COMPONENTS Client
+)
+
 
 add_executable(WaylandInputWindow
     main.cpp
@@ -31,11 +40,7 @@ target_compile_definitions(WaylandInputWindow
     PRIVATE "CMAKE_PROJECT_PATH=\"${PROJECT_SOURCE_DIR}\""
 )
 
-# TODO:
-# 1. Find the wayland-client library
-# 2. Provide its header path directory to the target
-
 target_link_libraries(WaylandInputWindow
     PRIVATE Threads::Threads
-    PRIVATE wayland-client # TODO: use the variable provided as a result of finding the wayland-client library
+    PRIVATE Wayland::Client
 )
