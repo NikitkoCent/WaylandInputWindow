@@ -34,6 +34,9 @@ struct WLAppCtx
     //   and making them able to be dragged, resized, maximized, etc
     WLResourceWrapper<xdg_wm_base*> xdgShell;
 
+    // The bridge to all input devices: mouses, keyboards, touchpads, touchscreens, etc.
+    WLResourceWrapper<wl_seat*> inputDevicesManager;
+
     struct
     {
         const std::size_t width  = 800;
@@ -108,10 +111,33 @@ struct WLAppCtx
         WLResourceWrapper<xdg_toplevel*> xdgToplevel;
     } mainWindow;
 
+    // Input devices
+    struct
+    {
+        WLResourceWrapper<wl_keyboard*> wlDevice;
+    } keyboard;
+
+    struct
+    {
+        WLResourceWrapper<wl_pointer*> wlDevice;
+    } pointingDev;
+
+    struct
+    {
+        WLResourceWrapper<wl_touch*> wlDevice;
+    } touchScreen;
+
+
+    bool shouldExit = false;
+
 
     ~WLAppCtx() noexcept
     {
         // Keeping the correct order of the resources disposal
+
+        touchScreen.wlDevice.reset();
+        pointingDev.wlDevice.reset();
+        keyboard.wlDevice.reset();
 
         mainWindow.xdgToplevel.reset();
         mainWindow.xdgSurface.reset();
@@ -122,6 +148,7 @@ struct WLAppCtx
         mainWindow.surfaceSharedBuffer.dispose();
 
         availableGlobalObjects.clear();
+        inputDevicesManager.reset();
         xdgShell.reset();
         shmProvider.reset();
         compositor.reset();
@@ -484,6 +511,155 @@ int main(int, char*[])
         MY_LOG_WLCALL_VALUELESS(xdg_toplevel_set_title(*appCtx.mainWindow.xdgToplevel, "WaylandInputWindow"));
 
         // ============================================== END of Step 5 ===============================================
+
+        // ================================ Step 6: Input: binding to a wl_seat global ================================
+        MY_LOG_INFO("Looking up a wl_seat global object and binding to it, the version supported by this client: ", wl_seat_interface.version, "...");
+        for (auto& [name, objInfo] : appCtx.availableGlobalObjects)
+        {
+            if (objInfo.interface == wl_seat_interface.name)
+            {
+                MY_LOG_INFO("    ... Found a wl_seat global object of version=", objInfo.version, " with name=", name);
+
+                const auto versionToBind = std::min<uint32_t>(wl_seat_interface.version, objInfo.version);
+
+                appCtx.inputDevicesManager = makeWLResourceWrapperChecked(
+                    static_cast<wl_seat*>(MY_LOG_WLCALL(wl_registry_bind(
+                        *appCtx.registry,
+                        name,
+                        &wl_seat_interface,
+                        versionToBind
+                    ))),
+                    nullptr,
+                    [versionToBind](auto& seat) {
+                        if (versionToBind < 5)
+                            MY_LOG_WLCALL_VALUELESS(wl_seat_destroy(seat));
+                        else
+                            MY_LOG_WLCALL_VALUELESS(wl_seat_release(seat));
+                        seat = nullptr;
+                    }
+                );
+                if (!appCtx.inputDevicesManager.hasResource())
+                    throw std::system_error{errno, std::system_category(), "Failed to bind to the wl_seat using the version=" + std::to_string(versionToBind)};
+
+                objInfo.bindedVersion = versionToBind;
+
+                break;
+            }
+        }
+        if (!appCtx.inputDevicesManager.hasResource())
+            throw std::runtime_error{"Found no wl_seat objects"};
+        // ============================================== END of Step 6 ===============================================
+
+        // ======================== Step 7: Input: listening to the input devices availability ========================
+
+        // We will connect to/disconnect from input devices asynchronously via this listener, because
+        //   wl_seat::capabilities events are the only way to get know that an input device becomes
+        //   available (attached)/unavailable (detached)
+        struct InputDevicesListenerBridge final
+        {
+            WLAppCtx& appCtx;
+            const wl_seat_listener wlHandler = { &onCapabilities, &onName };
+
+        public:
+            using KeyboardAttachedEventListener = std::function<void()>;
+            using KeyboardDetachedEventListener = std::function<void()>;
+
+            using PointingDevAttachedEventListener = std::function<void()>;
+            using PointingDevDetachedEventListener = std::function<void()>;
+
+            using TouchscreenAttachedEventListener = std::function<void()>;
+            using TouchscreenDetachedEventListener = std::function<void()>;
+
+        public:
+            InputDevicesListenerBridge(WLAppCtx& appCtx) noexcept
+                : appCtx(appCtx)
+            {}
+
+        public:
+            void addKeyboardAttachedEventListener(KeyboardAttachedEventListener listener)
+            { kbAttachedListeners_.emplace_back(std::move(listener)); }
+            void addKeyboardDetachedEventListener(KeyboardDetachedEventListener listener)
+            { kbDetachedListeners_.emplace_back(std::move(listener)); }
+
+            void addPointingDevAttachedEventListener(PointingDevAttachedEventListener listener)
+            { pdAttachedListeners_.emplace_back(std::move(listener)); }
+            void addPointingDevDetachedEventListener(PointingDevDetachedEventListener listener)
+            { pdDetachedListeners_.emplace_back(std::move(listener)); }
+
+            void addTouchscreenAttachedEventListener(TouchscreenAttachedEventListener listener)
+            { tsAttachedListeners_.emplace_back(std::move(listener)); }
+            void addTouchscreenDetachedEventListener(TouchscreenDetachedEventListener listener)
+            { tsDetachedListeners_.emplace_back(std::move(listener)); }
+
+        private:
+            std::vector<KeyboardAttachedEventListener> kbAttachedListeners_;
+            std::vector<KeyboardDetachedEventListener> kbDetachedListeners_;
+            std::vector<PointingDevAttachedEventListener> pdAttachedListeners_;
+            std::vector<PointingDevDetachedEventListener> pdDetachedListeners_;
+            std::vector<TouchscreenAttachedEventListener> tsAttachedListeners_;
+            std::vector<TouchscreenDetachedEventListener> tsDetachedListeners_;
+
+        private:
+            static void onCapabilities(void * const selfP, wl_seat * const manager, const uint32_t capabilities)
+            {
+                MY_LOG_TRACE("inputDevicesListener::onCapabilities(selfP=", selfP, ", manager=", manager, ", capabilities=", capabilities, ')');
+
+                auto& self = *static_cast<InputDevicesListenerBridge*>(selfP);
+
+                const bool thereIsKeyboard = ( (capabilities & wl_seat_capability::WL_SEAT_CAPABILITY_KEYBOARD) != 0 );
+                if ( thereIsKeyboard && !self.appCtx.keyboard.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: a new keyboard device has got available.");
+                    for (const auto& l : self.kbAttachedListeners_)
+                        l();
+                }
+                else if ( !thereIsKeyboard && self.appCtx.keyboard.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: the keyboard device has disappeared.");
+                    for (const auto& l : self.kbDetachedListeners_)
+                        l();
+                }
+
+                const bool thereIsPointingDev = ( (capabilities & wl_seat_capability::WL_SEAT_CAPABILITY_POINTER) != 0 );
+                if ( thereIsPointingDev && !self.appCtx.pointingDev.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: a new pointing device has got available.");
+                    for (const auto& l : self.pdAttachedListeners_)
+                        l();
+                }
+                else if ( !thereIsPointingDev && self.appCtx.pointingDev.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: the pointing device has disappeared.");
+                    for (const auto& l : self.pdDetachedListeners_)
+                        l();
+                }
+
+                const bool thereIsTouchscreen = ( (capabilities & wl_seat_capability::WL_SEAT_CAPABILITY_TOUCH) != 0 );
+                if ( thereIsTouchscreen && !self.appCtx.touchScreen.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: a new touchscreen has got available.");
+                    for (const auto& l : self.tsAttachedListeners_)
+                        l();
+                }
+                else if ( !thereIsTouchscreen && self.appCtx.touchScreen.wlDevice.hasResource() )
+                {
+                    MY_LOG_INFO("inputDevicesListener::onCapabilities: the touchscreen has disappeared.");
+                    for (const auto& l : self.tsDetachedListeners_)
+                        l();
+                }
+            }
+
+            static void onName(void * const /*self*/, wl_seat * const /*manager*/, const char* const /*nameUtf8*/)
+            { /*These events aren't interesting for now*/ }
+        } inputDevicesListener{ appCtx };
+
+        if (const auto err = MY_LOG_WLCALL(wl_seat_add_listener(*appCtx.inputDevicesManager, &inputDevicesListener.wlHandler, &inputDevicesListener)); err != 0)
+            throw std::system_error(
+                errno,
+                std::system_category(),
+                "Failed to set the input devices listener (wl_seat_add_listener returned " + std::to_string(err) + ")"
+            );
+        // ============================================== END of Step 7 ===============================================
     }
     catch (const std::system_error& err)
     {
