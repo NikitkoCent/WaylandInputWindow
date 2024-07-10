@@ -660,6 +660,233 @@ int main(int, char*[])
                 "Failed to set the input devices listener (wl_seat_add_listener returned " + std::to_string(err) + ")"
             );
         // ============================================== END of Step 7 ===============================================
+
+        // ======================== Step 8: Input: handling pointing devices (mice, touchpads) ========================
+
+        // Installing wl_pointer_listener
+        struct PointingDeviceListener
+        {
+            WLAppCtx& appCtx;
+            const wl_pointer_listener wlHandler = {
+                &onEnter,
+                &onLeave,
+                &onMotion,
+                &onButton,
+                &onAxis,
+                &onFrame,
+                &onAxisSource,
+                &onAxisStop,
+                &onAxisDiscrete/*,
+                // Only available since version 8
+                onAxisValue120,
+                // Only available since version 9
+                onAxisRelativeDirection
+                */
+            };
+
+        private: // wl_handler's callbacks
+            // Notification that the pointer is focused on a certain surface
+            static void onEnter(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evSerial,
+                wl_surface * const enteredSurface,
+                const wl_fixed_t surfaceLocalX,
+                const wl_fixed_t surfaceLocalY
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onEnter(selfP=", selfP, ", ",
+                                                             "pd=", pd, ", ",
+                                                             "evSerial=", evSerial, ", ",
+                                                             "enteredSurface=", enteredSurface, ", ",
+                                                             "surfaceLocalX=", surfaceLocalX, ", ",
+                                                             "surfaceLocalY=", surfaceLocalY,
+                                                             ')');
+            }
+
+            // Notification that the pointer is no longer focused on a certain surface
+            static void onLeave(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evSerial,
+                wl_surface * const surfaceLeft
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onLeave(selfP=", selfP, ", ",
+                                                             "pd=", pd, ", ",
+                                                             "evSerial=", evSerial, ", ",
+                                                             "surfaceLeft=", surfaceLeft,
+                                                             ')');
+            }
+
+            // Notification of pointer location change
+            static void onMotion(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evTimestampMs,
+                const wl_fixed_t surfaceLocalX,
+                const wl_fixed_t surfaceLocalY
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onMotion(selfP=", selfP, ", ",
+                                                              "pd=", pd, ", ",
+                                                              "evTimestampMs=", evTimestampMs, ", ",
+                                                              "surfaceLocalX=", surfaceLocalX, ", ",
+                                                              "surfaceLocalY=", surfaceLocalY,
+                                                              ')');
+            }
+
+            // Mouse button click and release notifications
+            static void onButton(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evSerial,
+                const uint32_t evTimestampMs,
+                const uint32_t button,
+                const uint32_t state
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onButton(selfP=", selfP, ", ",
+                                                              "pd=", pd, ", ",
+                                                              "evSerial=", evSerial, ", ",
+                                                              "evTimestampMs=", evTimestampMs, ", ",
+                                                              "button=", button, ", ",
+                                                              "state=", state,
+                                                              ')');
+            }
+
+            // Scroll and other axis notifications
+            static void onAxis(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evTimestampMs,
+                const uint32_t axisType,
+                // For scroll events (vertical and horizontal scroll axes), it is the length of
+                //   a vector along the specified axis in a coordinate space identical to those of motion events,
+                //   representing a relative movement along the specified axis.
+                const wl_fixed_t value
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onAxis(selfP=", selfP, ", ",
+                                                            "pd=", pd, ", ",
+                                                            "evTimestampMs=", evTimestampMs, ", ",
+                                                            "axisType=", axisType, ", ",
+                                                            "value=", value,
+                                                            ')');
+            }
+
+            // Indicates the end of a set of events that logically belong together.
+            // A client is expected to accumulate the data in all events within the frame before proceeding
+            static void onFrame(
+                void * const selfP,
+                wl_pointer * const pd
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onFrame(selfP=", selfP, ", ",
+                                                             "pd=", pd,
+                                                             ')');
+            }
+
+            // Source information for scroll and other axes
+            static void onAxisSource(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t axisSource
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onAxisSource(selfP=", selfP, ", ",
+                                                                  "pd=", pd, ", ",
+                                                                  "axisSource=", axisSource,
+                                                                  ')');
+            }
+
+            // Stop notification for scroll and other axes.
+            // For some wl_pointer.axis_source types, a wl_pointer.axis_stop event is sent to notify a client that
+            //   the axis sequence has terminated.
+            // This enables the client to implement kinetic scrolling.
+            // See the wl_pointer.axis_source documentation for information on when this event may be generated.
+            static void onAxisStop(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t evTimestampMs,
+                const uint32_t axisStopped
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onAxisStop(selfP=", selfP, ", ",
+                                                                "pd=", pd, ", ",
+                                                                "evTimestampMs=", evTimestampMs, ", ",
+                                                                "axisStopped=", axisStopped,
+                                                                ')');
+            }
+
+            // Discrete step information for scroll and other axes.
+            // This event carries the axis value of the wl_pointer.axis event in discrete steps
+            //   (e.g. mouse wheel clicks).
+            // This event is deprecated with wl_pointer version 8 - this event is not sent to clients supporting
+            //   version 8 or later.
+            static void onAxisDiscrete(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t axisType,
+                const int32_t discreteNumberOfSteps
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onAxisDiscrete(selfP=", selfP, ", ",
+                                                                    "pd=", pd, ", ",
+                                                                    "axisType=", axisType, ", ",
+                                                                    "discreteNumberOfSteps=", discreteNumberOfSteps,
+                                                                    ')');
+
+                return (void)onAxisValue120(selfP, pd, axisType, discreteNumberOfSteps * 120);
+            }
+
+            // Axis high-resolution scroll event
+            // Discrete high-resolution scroll information.
+            // This event replaces the wl_pointer.axis_discrete event in clients supporting wl_pointer version 8
+            //   or later.
+            static void onAxisValue120(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t axisType,
+                const int32_t one120thFractionsOf1Step
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onAxisValue120(selfP=", selfP, ", ",
+                                                                    "pd=", pd, ", ",
+                                                                    "axisType=", axisType, ", ",
+                                                                    "one120thFractionsOf1Step=", one120thFractionsOf1Step,
+                                                                    ')');
+            }
+
+            // Relative directional information of the entity causing the axis motion.
+            // For a wl_pointer.axis event, the wl_pointer.axis_relative_direction event specifies
+            //   the movement direction of the entity causing the wl_pointer.axis event.
+            // For example:
+            //   - if a user's fingers on a touchpad move down and this causes a wl_pointer.axis vertical_scroll down
+            //     event, the physical direction is 'identical'
+            //   - if a user's fingers on a touchpad move down and this causes a wl_pointer.axis vertical_scroll up
+            //     event ('natural scrolling'), the physical direction is 'inverted'.
+            // A client may use this information to adjust scroll motion of components.
+            // Specifically, enabling natural scrolling causes the content to change direction compared to traditional
+            //   scrolling.
+            // Some widgets like volume control sliders should usually match the physical direction regardless of
+            //   whether natural scrolling is active.
+            // This event enables clients to match the scroll direction of a widget to the physical direction.
+            static void onAxisRelativeDirection(
+                void * const selfP,
+                wl_pointer * const pd,
+                const uint32_t axisType,
+                const uint32_t relativeDirectionType
+            );
+        } pdListener{ appCtx };
+
+        inputDevicesListener.addPointingDevAttachedEventListener([&appCtx, &pdListener] {
+            appCtx.pointingDev.wlDevice = makeWLResourceWrapperChecked(
+                MY_LOG_WLCALL(wl_seat_get_pointer(*appCtx.inputDevicesManager)),
+                nullptr,
+                [](auto& pd) { MY_LOG_WLCALL_VALUELESS(wl_pointer_release(pd)); pd = nullptr; }
+            );
+            if (!appCtx.pointingDev.wlDevice.hasResource())
+                throw std::system_error{errno, std::system_category(), "Failed to obtain a pointing device (wl_pointer), although it had been available"};
+
+            if (const auto err = MY_LOG_WLCALL(wl_pointer_add_listener(*appCtx.pointingDev.wlDevice, &pdListener.wlHandler, &pdListener)); err != 0)
+                throw std::system_error{
+                    errno,
+                    std::system_category(),
+                    "Failed to set the pointing device listener (wl_pointer_add_listener returned " + std::to_string(err) + ")"
+                };
+        });
+        // ============================================== END of Step 8 ===============================================
     }
     catch (const std::system_error& err)
     {
