@@ -158,11 +158,27 @@ struct WLAppCtx
 };
 
 
+struct ContentState
+{
+    int viewportOffsetX = 0;
+    int viewportOffsetY = 0;
+
+    // (0; +inf). 1.0 means normal zoom (100%), 0.5 - 50%, 2.0 - 200%, etc.
+    double viewportZoom = 1;
+    unsigned viewportZoomCenterX = 0;
+    unsigned viewportZoomCenterY = 0;
+};
+
+
+static void renderMainWindow(WLAppCtx& appCtx, ContentState contentState);
+
+
 int main(int, char*[])
 {
     try
     {
         WLAppCtx appCtx;
+        ContentState contentState;
 
         // ========================== Step 1: make a connection to the Wayland server/compositor ======================
         appCtx.connection = makeWLResourceWrapperChecked(
@@ -450,9 +466,7 @@ int main(int, char*[])
         MY_LOG_WLCALL_VALUELESS(wl_surface_attach(*appCtx.mainWindow.surface, appCtx.mainWindow.getPendingWLSideBuffer(), 0, 0));
 
         // Initializing the buffer with the "silver" (#C0C0C0) color
-        appCtx.mainWindow.drawVia([](std::size_t /*x*/, std::size_t /*y*/, std::byte& b, std::byte& g, std::byte& r) {
-            b = g = r = std::byte{0xC0};
-        });
+        renderMainWindow(appCtx, contentState);
         // Letting the server know that it should re-render the whole buffer
         MY_LOG_WLCALL_VALUELESS(wl_surface_damage_buffer(*appCtx.mainWindow.surface, 0, 0, appCtx.mainWindow.width, appCtx.mainWindow.height));
         // ============================================== END of Step 4 ===============================================
@@ -906,3 +920,50 @@ int main(int, char*[])
 
     return 0;
 }
+
+
+void renderMainWindow(WLAppCtx& appCtx, ContentState contentState)
+{
+    //if (contentState.contentZoom <= 0)
+    //    throw std::range_error{ "contentState.contentZoom <= 0" };
+
+    // Rendering the chess board pattern respecting the content's offsets and zoom
+
+    constexpr auto cellSideBasicSize = 60 /*px*/;
+
+    const auto sideZoom = std::sqrt(contentState.viewportZoom);
+
+    appCtx.mainWindow.drawVia([cs = contentState, zoom = sideZoom](std::size_t x, std::size_t y, std::byte& b, std::byte& g, std::byte& r) {
+        const auto xRelZoomCenter = (x > cs.viewportZoomCenterX)
+                                    ? static_cast<int>(x - cs.viewportZoomCenterX)
+                                    : -static_cast<int>(cs.viewportZoomCenterX - x);
+        const auto srcXRelZoomCenter = static_cast< std::remove_cv_t<decltype(xRelZoomCenter)> >(std::round(xRelZoomCenter / zoom));
+        const auto srcXGlobal = static_cast<std::int64_t>(cs.viewportOffsetX) +
+                                static_cast<std::int64_t>(cs.viewportZoomCenterX) +
+                                static_cast<std::int64_t>(srcXRelZoomCenter);
+
+        const auto yRelZoomCenter = (y > cs.viewportZoomCenterY)
+                                    ? static_cast<int>(y - cs.viewportZoomCenterY)
+                                    : -static_cast<int>(cs.viewportZoomCenterY - y);
+        const auto srcYRelZoomCenter = static_cast< std::remove_cv_t<decltype(yRelZoomCenter)> >(std::round(yRelZoomCenter / zoom));
+        const auto srcYGlobal = static_cast<std::int64_t>(cs.viewportOffsetY) +
+                                static_cast<std::int64_t>(cs.viewportZoomCenterY) +
+                                static_cast<std::int64_t>(srcYRelZoomCenter);
+
+        const auto srcCellColumn = (srcXGlobal > 0)
+                                   ? (srcXGlobal / cellSideBasicSize)
+                                   : -(1 + (-srcXGlobal / cellSideBasicSize));
+        const auto srcRowColumn = (srcYGlobal > 0)
+                                   ? (srcYGlobal / cellSideBasicSize)
+                                   : -(1 + (-srcYGlobal / cellSideBasicSize));
+
+        const bool columnIsEven = ( (srcCellColumn % 2) == 0 );
+        const bool rowIsEven    = ( (srcRowColumn % 2) == 0 );
+
+        if (columnIsEven == rowIsEven)
+            r = g = b = std::byte{0x00}; // pure black
+        else
+            r = g = b = std::byte{0xC0}; // silver
+    });
+}
+
