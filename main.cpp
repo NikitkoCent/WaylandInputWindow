@@ -109,6 +109,11 @@ struct WLAppCtx
 
         WLResourceWrapper<xdg_surface*> xdgSurface;
         WLResourceWrapper<xdg_toplevel*> xdgToplevel;
+
+        // Indicates explicit requests for re-rendering
+        bool mustBeRedrawn = false;
+        // The rendering requests are delayed until the flag is false
+        bool readyToBeRedrawn = false;
     } mainWindow;
 
     // Input devices
@@ -481,13 +486,9 @@ int main(int, char*[])
         if (!appCtx.mainWindow.surface.hasResource())
             throw std::system_error(errno, std::system_category(), "Failed to create a wl_surface for the main window");
 
-        // Initially attaching the first buffer to the surface
-        MY_LOG_WLCALL_VALUELESS(wl_surface_attach(*appCtx.mainWindow.surface, appCtx.mainWindow.getPendingWLSideBuffer(), 0, 0));
-
-        // Initializing the buffer with the "silver" (#C0C0C0) color
-        renderMainWindow(appCtx, contentState);
-        // Letting the server know that it should re-render the whole buffer
-        MY_LOG_WLCALL_VALUELESS(wl_surface_damage_buffer(*appCtx.mainWindow.surface, 0, 0, appCtx.mainWindow.width, appCtx.mainWindow.height));
+        // Will render the content right before the event loop below
+        appCtx.mainWindow.mustBeRedrawn = true;
+        appCtx.mainWindow.readyToBeRedrawn = true;
         // ============================================== END of Step 4 ===============================================
 
         // ============ Step 5: assigning the role to the main window surface using the XDG shell protocol ============
