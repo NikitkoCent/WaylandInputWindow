@@ -160,14 +160,33 @@ struct WLAppCtx
 
 struct ContentState
 {
-    int viewportOffsetX = 0;
-    int viewportOffsetY = 0;
+    double viewportOffsetX = 0;
+    double viewportOffsetY = 0;
 
     // (0; +inf). 1.0 means normal zoom (100%), 0.5 - 50%, 2.0 - 200%, etc.
     double viewportZoom = 1;
-    unsigned viewportZoomCenterX = 0;
-    unsigned viewportZoomCenterY = 0;
+    // The point is in the viewport local coordinate system, so it must be within the range [0; width)
+    double viewportZoomCenterLocalX = 0;
+    // The point is in the viewport local coordinate system, so it must be within the range [0; height)
+    double viewportZoomCenterLocalY = 0;
+
+public:
+    static constexpr double ZOOM_FACTOR = 1.25;
+
+public: // modifiers
+    ContentState movedFor(double offsetX, double offsetY) const;
+
+    ContentState zoomedIn(double zoomFactor = ZOOM_FACTOR) const;
+    ContentState zoomedIn(unsigned newZoomCenterX, unsigned newZoomCenterY, double zoomFactor = ZOOM_FACTOR) const;
+
+    ContentState zoomedOut(double zoomFactor = ZOOM_FACTOR) const;
+    ContentState zoomedOut(unsigned newZoomCenterX, unsigned newZoomCenterY, double zoomFactor = ZOOM_FACTOR) const;
+
+    ContentState restoredZoom() const;
 };
+
+bool operator==(const ContentState& lhs, const ContentState& rhs) noexcept;
+bool operator!=(const ContentState& lhs, const ContentState& rhs) noexcept;
 
 
 static void renderMainWindow(WLAppCtx& appCtx, ContentState contentState);
@@ -922,6 +941,32 @@ int main(int, char*[])
 }
 
 
+ContentState ContentState::movedFor(double offsetX, double offsetY) const
+{
+    return ContentState{
+        viewportOffsetX + offsetX,
+        viewportOffsetY + offsetY,
+        viewportZoom,
+        viewportZoomCenterLocalX,
+        viewportZoomCenterLocalY
+    };
+}
+
+bool operator==(const ContentState& lhs, const ContentState& rhs) noexcept
+{
+    return ( (lhs.viewportOffsetX == rhs.viewportOffsetX) &&
+             (lhs.viewportOffsetY == rhs.viewportOffsetY) &&
+             (lhs.viewportZoom == rhs.viewportZoom) &&
+             (lhs.viewportZoomCenterLocalX == rhs.viewportZoomCenterLocalX) &&
+             (lhs.viewportZoomCenterLocalY == rhs.viewportZoomCenterLocalY) );
+}
+
+bool operator!=(const ContentState& lhs, const ContentState& rhs) noexcept
+{
+    return !(lhs == rhs);
+}
+
+
 void renderMainWindow(WLAppCtx& appCtx, ContentState contentState)
 {
     //if (contentState.contentZoom <= 0)
@@ -931,23 +976,46 @@ void renderMainWindow(WLAppCtx& appCtx, ContentState contentState)
 
     constexpr auto cellSideBasicSize = 60 /*px*/;
 
+
+    const int viewportOffsetXRound = static_cast<int>(std::round(contentState.viewportOffsetX));
+    const double xOffsetDiff = viewportOffsetXRound - contentState.viewportOffsetX;
+
+    const int viewportOffsetYRound = static_cast<int>(std::round(contentState.viewportOffsetY));
+    const double yOffsetDiff = viewportOffsetYRound - contentState.viewportOffsetY;
+
     const auto sideZoom = std::sqrt(contentState.viewportZoom);
 
-    appCtx.mainWindow.drawVia([cs = contentState, zoom = sideZoom](std::size_t x, std::size_t y, std::byte& b, std::byte& g, std::byte& r) {
-        const auto xRelZoomCenter = (x > cs.viewportZoomCenterX)
-                                    ? static_cast<int>(x - cs.viewportZoomCenterX)
-                                    : -static_cast<int>(cs.viewportZoomCenterX - x);
+    // Adjusting the zoom center with respect to the viewport position change
+    const unsigned zoomCenterLocalX = static_cast<unsigned>(
+        std::clamp<double>(
+            std::round(contentState.viewportZoomCenterLocalX + xOffsetDiff),
+            0,
+            appCtx.mainWindow.width - 1
+        )
+    );
+    const unsigned zoomCenterLocalY = static_cast<unsigned>(
+        std::clamp<double>(
+            std::round(contentState.viewportZoomCenterLocalY + yOffsetDiff),
+            0,
+            appCtx.mainWindow.height - 1
+        )
+    );
+
+    appCtx.mainWindow.drawVia([viewportOffsetXRound, viewportOffsetYRound, zoom = sideZoom, zoomCenterLocalX, zoomCenterLocalY](std::size_t x, std::size_t y, std::byte& b, std::byte& g, std::byte& r) {
+        const auto xRelZoomCenter = (x > zoomCenterLocalX)
+                                    ? static_cast<int>(x - zoomCenterLocalX)
+                                    : -static_cast<int>(zoomCenterLocalX - x);
         const auto srcXRelZoomCenter = static_cast< std::remove_cv_t<decltype(xRelZoomCenter)> >(std::round(xRelZoomCenter / zoom));
-        const auto srcXGlobal = static_cast<std::int64_t>(cs.viewportOffsetX) +
-                                static_cast<std::int64_t>(cs.viewportZoomCenterX) +
+        const auto srcXGlobal = static_cast<std::int64_t>(viewportOffsetXRound) +
+                                static_cast<std::int64_t>(zoomCenterLocalX) +
                                 static_cast<std::int64_t>(srcXRelZoomCenter);
 
-        const auto yRelZoomCenter = (y > cs.viewportZoomCenterY)
-                                    ? static_cast<int>(y - cs.viewportZoomCenterY)
-                                    : -static_cast<int>(cs.viewportZoomCenterY - y);
+        const auto yRelZoomCenter = (y > zoomCenterLocalY)
+                                    ? static_cast<int>(y - zoomCenterLocalY)
+                                    : -static_cast<int>(zoomCenterLocalY - y);
         const auto srcYRelZoomCenter = static_cast< std::remove_cv_t<decltype(yRelZoomCenter)> >(std::round(yRelZoomCenter / zoom));
-        const auto srcYGlobal = static_cast<std::int64_t>(cs.viewportOffsetY) +
-                                static_cast<std::int64_t>(cs.viewportZoomCenterY) +
+        const auto srcYGlobal = static_cast<std::int64_t>(viewportOffsetYRound) +
+                                static_cast<std::int64_t>(zoomCenterLocalY) +
                                 static_cast<std::int64_t>(srcYRelZoomCenter);
 
         const auto srcCellColumn = (srcXGlobal > 0)
