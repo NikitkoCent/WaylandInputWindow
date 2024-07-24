@@ -1,13 +1,79 @@
-#include "utilities.h"      // WLResourceWrapper, makeWLResourceWrapperChecked, logging::*, MY_LOG_*
-#include <wayland-client.h> // wl_*
-#include <xdg-shell.h>      // xdg_*
-#include <string>           // std::string
-#include <string_view>      // std::string_view
-#include <unordered_map>    // std::unordered_map
-#include <optional>         // std::optional
-#include <vector>           // std::vector
-#include <utility>          // std::move
-#include <limits>           // std::numeric_limits
+#include "utilities.h"               // WLResourceWrapper, makeWLResourceWrapperChecked, logging::*, MY_LOG_*
+#include <wayland-client.h>          // wl_*
+#include <xdg-shell.h>               // xdg_*
+#include <linux/input-event-codes.h> // BTN_*
+#include <cstdint>                   // std::int*_t, std::uint*_t
+#include <string>                    // std::string
+#include <string_view>               // std::string_view
+#include <unordered_map>             // std::unordered_map
+#include <optional>                  // std::optional
+#include <variant>                   // std::variant
+#include <vector>                    // std::vector
+#include <utility>                   // std::move
+#include <limits>                    // std::numeric_limits
+#include <bitset>                    // std::bitset
+
+
+namespace wl_pointer_event_frame_types
+{
+    struct Enter final
+    {
+        std::uint32_t evSerial = 0;
+        wl_surface* surfaceEntered = nullptr;
+        double posX = 0;
+        double posY = 0;
+    };
+
+    struct Leave final
+    {
+        std::uint32_t evSerial = 0;
+        wl_surface* surfaceLeft = nullptr;
+    };
+
+    struct Motion final
+    {
+        std::uint32_t evTimestampMs;
+        double surfaceLocalX;
+        double surfaceLocalY;
+    };
+
+    struct Button final
+    {
+        std::uint32_t evSerial;
+        std::uint32_t evTimestampMs;
+        std::uint32_t button;
+        wl_pointer_button_state state;
+    };
+
+    struct Axes final
+    {
+        struct Axis final
+        {
+            // wl_pointer::axis
+
+            std::optional<std::uint32_t> launchedTimestampMs;
+            // For scroll events (vertical and horizontal scroll axes), it is the length of
+            //   a vector along the specified axis in a coordinate space identical to those of motion events,
+            //   representing a relative movement along the specified axis.
+            std::optional<double> value;
+
+            // wl_pointer::axis_stop
+            std::optional<std::uint32_t> stoppedTimestampMs;
+
+            // wl_pointer::axis_discrete / wl_pointer::axis_value120 (since ver.5 / 8)
+            std::optional<std::int32_t> one120thFractionsOfWheelStep;
+
+            // wl_pointer::axis_relative_direction (since ver.9)
+            std::optional<std::uint32_t> relativeDirectionType;
+        };
+
+        std::optional<Axis> horizontal;
+        std::optional<Axis> vertical;
+
+        // wl_pointer::axis_source
+        std::optional<wl_pointer_axis_source> axisSource;
+    };
+}
 
 
 /** Holds the whole state required for the app functioning */
@@ -122,9 +188,45 @@ struct WLAppCtx
         WLResourceWrapper<wl_keyboard*> wlDevice;
     } keyboard;
 
-    struct
+    struct PointingDevice
     {
         WLResourceWrapper<wl_pointer*> wlDevice;
+
+
+        struct PositionOnSurface
+        {
+            double x = 0;
+            double y = 0;
+        };
+        // The empty optional means the pointer isn't over the surface
+        std::optional<PositionOnSurface> positionOnMainWindowSurface;
+
+        // buttonsPressedState[i] is true if ith button is pressed
+        std::bitset<32> buttonsPressedState;
+        enum : std::uint8_t
+        {
+            IDX_LMB = 0,
+            IDX_RMB = 1,
+            // usually the wheel
+            IDX_MMB = 2,
+            IDX_OTHERS_BEGIN
+        };
+
+
+        // Holds the accumulated data of all wl_pointer events until a wl_pointer::frame is received
+        struct EventFrame
+        {
+            wl_pointer* sourceDev;
+
+            std::variant<
+                wl_pointer_event_frame_types::Enter,
+                wl_pointer_event_frame_types::Leave,
+                wl_pointer_event_frame_types::Motion,
+                wl_pointer_event_frame_types::Button,
+                wl_pointer_event_frame_types::Axes
+            > info;
+        };
+        std::optional<EventFrame> eventFrame;
     } pointingDev;
 
     struct
@@ -701,6 +803,8 @@ int main(int, char*[])
         struct PointingDeviceListener
         {
             WLAppCtx& appCtx;
+            ContentState& contentState;
+
             const wl_pointer_listener wlHandler = {
                 &onEnter,
                 &onLeave,
@@ -719,6 +823,44 @@ int main(int, char*[])
             };
 
         private: // wl_handler's callbacks
+            // Indicates the end of a set of events that logically belong together.
+            // A client is expected to accumulate the data in all events within the frame before proceeding
+            static void onFrame(
+                void * const selfP,
+                wl_pointer * const pd
+            ) {
+                MY_LOG_TRACE("PointingDeviceListener::onFrame(selfP=", selfP, ", ",
+                                                             "pd=", pd,
+                                                             ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                if (!self.appCtx.pointingDev.eventFrame.has_value())
+                {
+                    MY_LOG_WARN("An empty wl_pointer frame to handle. Discarding.");
+                    return;
+                }
+
+                auto evFrame = std::move(*self.appCtx.pointingDev.eventFrame);
+                self.appCtx.pointingDev.eventFrame.reset();
+
+                if (pd != evFrame.sourceDev)
+                {
+                    MY_LOG_ERROR("The wl_pointer=", pd, " of the wl_pointer::frame event doesn't correspond to the wl_pointer=", evFrame.sourceDev, " initialized the frame. Discarding the frame.");
+                    return;
+                }
+                if (evFrame.sourceDev != self.appCtx.pointingDev.wlDevice)
+                {
+                    auto * const wlDevice = self.appCtx.pointingDev.wlDevice.hasResource() ? &*self.appCtx.pointingDev.wlDevice : nullptr;
+                    MY_LOG_WARN("The wl_pointer=", evFrame.sourceDev, " of the wl_pointer frame isn't the current wl_pointer=", wlDevice, ". Discarding the frame.");
+                    return;
+                }
+
+                std::visit([&self](auto& frame) {
+                    self.handleFrame(std::move(frame));
+                }, evFrame.info);
+            }
+
             // Notification that the pointer is focused on a certain surface
             static void onEnter(
                 void * const selfP,
@@ -735,6 +877,26 @@ int main(int, char*[])
                                                              "surfaceLocalX=", surfaceLocalX, ", ",
                                                              "surfaceLocalY=", surfaceLocalY,
                                                              ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                if (self.appCtx.pointingDev.eventFrame.has_value())
+                {
+                    MY_LOG_ERROR("The wl_pointer frame already contains an event. Skipping this wl_pointer::enter.");
+                    return;
+                }
+
+                const auto xD = wl_fixed_to_double(surfaceLocalX);
+                const auto yD = wl_fixed_to_double(surfaceLocalY);
+
+                self.appCtx.pointingDev.eventFrame.emplace(
+                    WLAppCtx::PointingDevice::EventFrame{
+                        pd,
+                        wl_pointer_event_frame_types::Enter{
+                            evSerial, enteredSurface, xD, yD
+                        }
+                    }
+                );
             }
 
             // Notification that the pointer is no longer focused on a certain surface
@@ -749,6 +911,23 @@ int main(int, char*[])
                                                              "evSerial=", evSerial, ", ",
                                                              "surfaceLeft=", surfaceLeft,
                                                              ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                if (self.appCtx.pointingDev.eventFrame.has_value())
+                {
+                    MY_LOG_ERROR("The wl_pointer frame already contains an event. Skipping this wl_pointer::leave.");
+                    return;
+                }
+
+                self.appCtx.pointingDev.eventFrame.emplace(
+                    WLAppCtx::PointingDevice::EventFrame{
+                        pd,
+                        wl_pointer_event_frame_types::Leave{
+                            evSerial, surfaceLeft
+                        }
+                    }
+                );
             }
 
             // Notification of pointer location change
@@ -765,6 +944,26 @@ int main(int, char*[])
                                                               "surfaceLocalX=", surfaceLocalX, ", ",
                                                               "surfaceLocalY=", surfaceLocalY,
                                                               ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                if (self.appCtx.pointingDev.eventFrame.has_value())
+                {
+                    MY_LOG_ERROR("The wl_pointer frame already contains an event. Skipping this wl_pointer::motion.");
+                    return;
+                }
+
+                const auto xD = wl_fixed_to_double(surfaceLocalX);
+                const auto yD = wl_fixed_to_double(surfaceLocalY);
+
+                self.appCtx.pointingDev.eventFrame.emplace(
+                    WLAppCtx::PointingDevice::EventFrame{
+                        pd,
+                        wl_pointer_event_frame_types::Motion{
+                            evTimestampMs, xD, yD
+                        }
+                    }
+                );
             }
 
             // Mouse button click and release notifications
@@ -783,6 +982,23 @@ int main(int, char*[])
                                                               "button=", button, ", ",
                                                               "state=", state,
                                                               ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                if (self.appCtx.pointingDev.eventFrame.has_value())
+                {
+                    MY_LOG_ERROR("The wl_pointer frame already contains an event. Skipping this wl_pointer::button.");
+                    return;
+                }
+
+                self.appCtx.pointingDev.eventFrame.emplace(
+                    WLAppCtx::PointingDevice::EventFrame{
+                        pd,
+                        wl_pointer_event_frame_types::Button{
+                            evSerial, evTimestampMs, button, static_cast<wl_pointer_button_state>(state)
+                        }
+                    }
+                );
             }
 
             // Scroll and other axis notifications
@@ -802,17 +1018,31 @@ int main(int, char*[])
                                                             "axisType=", axisType, ", ",
                                                             "value=", value,
                                                             ')');
-            }
 
-            // Indicates the end of a set of events that logically belong together.
-            // A client is expected to accumulate the data in all events within the frame before proceeding
-            static void onFrame(
-                void * const selfP,
-                wl_pointer * const pd
-            ) {
-                MY_LOG_TRACE("PointingDeviceListener::onFrame(selfP=", selfP, ", ",
-                                                             "pd=", pd,
-                                                             ')');
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                auto* const axesFrameP = self.getAxesFramePtrOrNull(pd, "wl_pointer::axis");
+                if (axesFrameP == nullptr) return;
+                auto& axesFrame = *axesFrameP;
+
+                auto& axisToHandle = (axisType == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL)
+                                                       ? axesFrame.vertical
+                                                       : axesFrame.horizontal;
+
+                if (!axisToHandle.has_value())
+                    axisToHandle.emplace(wl_pointer_event_frame_types::Axes::Axis{});
+                else if (axisToHandle->value.has_value())
+                {
+                    MY_LOG_ERROR(
+                        "The wl_pointer frame already contains a ",
+                        (axisType == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL) ? "vertical" : "horizontal"
+                        " axis event. Skipping this one."
+                    );
+                    return;
+                }
+
+                axisToHandle->launchedTimestampMs = evTimestampMs;
+                axisToHandle->value = wl_fixed_to_double(value);
             }
 
             // Source information for scroll and other axes
@@ -825,6 +1055,19 @@ int main(int, char*[])
                                                                   "pd=", pd, ", ",
                                                                   "axisSource=", axisSource,
                                                                   ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                auto* const axesFrameP = self.getAxesFramePtrOrNull(pd, "wl_pointer::axis_source");
+                if (axesFrameP == nullptr) return;
+                auto& axesFrame = *axesFrameP;
+
+                if (axesFrame.axisSource.has_value())
+                {
+                    MY_LOG_ERROR("The wl_pointer frame already contains an wl_pointer::axis_source event. Skipping this one.");
+                    return;
+                }
+                axesFrame.axisSource = static_cast<wl_pointer_axis_source>(axisSource);
             }
 
             // Stop notification for scroll and other axes.
@@ -843,6 +1086,30 @@ int main(int, char*[])
                                                                 "evTimestampMs=", evTimestampMs, ", ",
                                                                 "axisStopped=", axisStopped,
                                                                 ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                auto* const axesFrameP = self.getAxesFramePtrOrNull(pd, "wl_pointer::axis_stop");
+                if (axesFrameP == nullptr) return;
+                auto& axesFrame = *axesFrameP;
+
+                auto& axisToHandle = (axisStopped == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL)
+                                                       ? axesFrame.vertical
+                                                       : axesFrame.horizontal;
+
+                if (!axisToHandle.has_value())
+                    axisToHandle.emplace(wl_pointer_event_frame_types::Axes::Axis{});
+                else if (axisToHandle->stoppedTimestampMs.has_value())
+                {
+                    MY_LOG_ERROR(
+                        "The wl_pointer frame already contains a ",
+                        (axisStopped == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL) ? "vertical" : "horizontal"
+                        " axis_stop event. Skipping this one."
+                    );
+                    return;
+                }
+
+                axisToHandle->stoppedTimestampMs = evTimestampMs;
             }
 
             // Discrete step information for scroll and other axes.
@@ -880,6 +1147,30 @@ int main(int, char*[])
                                                                     "axisType=", axisType, ", ",
                                                                     "one120thFractionsOf1Step=", one120thFractionsOf1Step,
                                                                     ')');
+
+                auto& self = *static_cast<PointingDeviceListener*>(selfP);
+
+                auto* const axesFrameP = self.getAxesFramePtrOrNull(pd, "wl_pointer::axis_discrete / axis_value120");
+                if (axesFrameP == nullptr) return;
+                auto& axesFrame = *axesFrameP;
+
+                auto& axisToHandle = (axisType == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL)
+                                                       ? axesFrame.vertical
+                                                       : axesFrame.horizontal;
+
+                if (!axisToHandle.has_value())
+                    axisToHandle.emplace(wl_pointer_event_frame_types::Axes::Axis{});
+                else if (axisToHandle->one120thFractionsOfWheelStep.has_value())
+                {
+                    MY_LOG_ERROR(
+                        "The wl_pointer frame already contains a ",
+                        (axisType == wl_pointer_axis::WL_POINTER_AXIS_VERTICAL_SCROLL) ? "vertical" : "horizontal"
+                        " axis_discrete/axis_value120 event. Skipping this one."
+                    );
+                    return;
+                }
+
+                axisToHandle->one120thFractionsOfWheelStep = one120thFractionsOf1Step;
             }
 
             // Relative directional information of the entity causing the axis motion.
@@ -902,7 +1193,185 @@ int main(int, char*[])
                 const uint32_t axisType,
                 const uint32_t relativeDirectionType
             );
-        } pdListener{ appCtx };
+
+        private: // onFrame helpers
+            void handleFrame(wl_pointer_event_frame_types::Enter enterFrame) const
+            {
+                MY_LOG_INFO(
+                    "Handling wl_pointer::enter EVENT frame:\n",
+                    "  serial        = ", enterFrame.evSerial, '\n',
+                    "  x             = ", enterFrame.posX, '\n',
+                    "  y             = ", enterFrame.posY, '\n',
+                    "  surface       = ", enterFrame.surfaceEntered
+                );
+
+                if (enterFrame.surfaceEntered != appCtx.mainWindow.surface)
+                {
+                    MY_LOG_WARN("wl_pointer::enter: the entered surface isn't the main window. Skipping the event frame.")
+                    return;
+                }
+
+                appCtx.pointingDev.positionOnMainWindowSurface = WLAppCtx::PointingDevice::PositionOnSurface{
+                    enterFrame.posX,
+                    enterFrame.posY
+                };
+                appCtx.pointingDev.buttonsPressedState.reset();
+            }
+
+            void handleFrame(wl_pointer_event_frame_types::Leave leaveFrame) const
+            {
+                MY_LOG_INFO(
+                    "Handling wl_pointer::leave EVENT frame:\n",
+                    "  serial        = ", leaveFrame.evSerial, '\n',
+                    "  surface       = ", leaveFrame.surfaceLeft
+                );
+
+                if (leaveFrame.surfaceLeft != appCtx.mainWindow.surface)
+                {
+                    MY_LOG_WARN("wl_pointer::leave: the surface left isn't the main window. Skipping the event frame.")
+                    return;
+                }
+
+                appCtx.pointingDev.buttonsPressedState.reset();
+                appCtx.pointingDev.positionOnMainWindowSurface.reset();
+            }
+
+            void handleFrame(wl_pointer_event_frame_types::Motion motionFrame) const
+            {
+                MY_LOG_INFO(
+                    "Handling wl_pointer::motion EVENT frame:\n",
+                    "  x             = ", motionFrame.surfaceLocalX, '\n',
+                    "  y             = ", motionFrame.surfaceLocalY, '\n',
+                    "  timestamp     = ", motionFrame.evTimestampMs, " (ms)"
+                );
+
+                if (
+                    appCtx.pointingDev.positionOnMainWindowSurface.has_value() &&
+                    // only LMB is pressed
+                    appCtx.pointingDev.buttonsPressedState.test(WLAppCtx::PointingDevice::IDX_LMB) &&
+                    (appCtx.pointingDev.buttonsPressedState.count() == 1)
+                   )
+                {
+                    const auto [currentX, currentY] = *appCtx.pointingDev.positionOnMainWindowSurface;
+
+                    MY_LOG_INFO("wl_pointer::motion: DRAG for x:", currentX, "->", motionFrame.surfaceLocalX, " ; ",
+                                                             "y:", currentY, "->", motionFrame.surfaceLocalY);
+
+                    const auto movingOffsetX = motionFrame.surfaceLocalX - currentX;
+                    const auto movingOffsetY = motionFrame.surfaceLocalY - currentY;
+
+                    if ((movingOffsetX != 0) || (movingOffsetY != 0))
+                    {
+                        // Subtracting is intended for the natural dragging effect
+                        contentState = contentState.movedFor(-movingOffsetX, -movingOffsetY);
+                        appCtx.mainWindow.mustBeRedrawn = true;
+                    }
+                }
+
+                appCtx.pointingDev.positionOnMainWindowSurface = WLAppCtx::PointingDevice::PositionOnSurface{
+                    motionFrame.surfaceLocalX,
+                    motionFrame.surfaceLocalY
+                };
+            }
+
+            void handleFrame(wl_pointer_event_frame_types::Button buttonFrame) const
+            {
+                const int buttonIdx = [linuxButton = buttonFrame.button]() -> int {
+                    switch (linuxButton)
+                    {
+                        // BTN_MOUSE
+                        case BTN_LEFT:      return WLAppCtx::PointingDevice::IDX_LMB;
+                        case BTN_RIGHT:     return WLAppCtx::PointingDevice::IDX_RMB;
+                        case BTN_MIDDLE:    return WLAppCtx::PointingDevice::IDX_MMB;
+                        case BTN_SIDE:      return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 0;
+                        case BTN_EXTRA:     return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 1;
+                        case BTN_FORWARD:   return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 2;
+                        case BTN_BACK:      return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 3;
+                        case BTN_TASK:      return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 4;
+
+                        // BTN_MISC
+                        case BTN_0:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 5;
+                        case BTN_1:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 6;
+                        case BTN_2:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 7;
+                        case BTN_3:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 8;
+                        case BTN_4:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 9;
+                        case BTN_5:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 10;
+                        case BTN_6:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 11;
+                        case BTN_7:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 12;
+                        case BTN_8:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 13;
+                        case BTN_9:         return WLAppCtx::PointingDevice::IDX_OTHERS_BEGIN + 14;
+                    }
+                    return -1;
+                }();
+
+                MY_LOG_INFO(
+                    "Handling wl_pointer::button EVENT frame:\n",
+                    "  state         = ", (buttonFrame.state == wl_pointer_button_state::WL_POINTER_BUTTON_STATE_PRESSED) ? "pressed" : "released", '\n',
+                    "  button        = ", buttonFrame.button, '\n',
+                    "  buttonIdx     = ", buttonIdx, '\n',
+                    "  timestamp     = ", buttonFrame.evTimestampMs, " (ms)"
+                );
+
+                if ( (buttonIdx < 0) || (static_cast<unsigned>(buttonIdx) >= appCtx.pointingDev.buttonsPressedState.size()) )
+                {
+                    MY_LOG_WARN("wl_pointer::button: an unsupported button #", buttonFrame.button, " has been pressed or released. Skipping the event frame.");
+                    return;
+                }
+
+                appCtx.pointingDev.buttonsPressedState[buttonIdx] = (buttonFrame.state == wl_pointer_button_state::WL_POINTER_BUTTON_STATE_PRESSED);
+                MY_LOG_INFO(
+                    "wl_pointer::button:\n"
+                    "  buttons state = ", appCtx.pointingDev.buttonsPressedState
+                );
+            }
+
+            void handleFrame(wl_pointer_event_frame_types::Axes axesFrame) const
+            {
+                MY_LOG_INFO(
+                    "Handling wl_pointer::axis EVENT frame:\n",
+                    "  vaxis         = ", axesFrame.vertical.has_value() ? axesFrame.vertical.value().value.value_or(0.0) : 0.0, '\n',
+                    "  haxis         = ", axesFrame.horizontal.has_value() ? axesFrame.horizontal.value().value.value_or(0.0) : 0.0
+                )
+
+                double movingOffsetX = 0;
+                double movingOffsetY = 0;
+
+                if (axesFrame.horizontal.has_value())
+                    movingOffsetX = axesFrame.horizontal->value.value_or(0);
+
+                if (axesFrame.vertical.has_value())
+                    movingOffsetY = axesFrame.vertical->value.value_or(0);
+
+                if ((movingOffsetX != 0) || (movingOffsetY != 0))
+                {
+                    contentState = contentState.movedFor(movingOffsetX, movingOffsetY);
+                    appCtx.mainWindow.mustBeRedrawn = true;
+                }
+            }
+
+        private: // onAxis... helpers
+            wl_pointer_event_frame_types::Axes* getAxesFramePtrOrNull(wl_pointer * const pd, std::string_view eventName) const
+            {
+                wl_pointer_event_frame_types::Axes* result = nullptr;
+
+                if (appCtx.pointingDev.eventFrame.has_value())
+                    result = std::get_if<wl_pointer_event_frame_types::Axes>(&appCtx.pointingDev.eventFrame->info);
+                else
+                    result = std::get_if<wl_pointer_event_frame_types::Axes>(
+                        &appCtx.pointingDev.eventFrame.emplace(
+                            WLAppCtx::PointingDevice::EventFrame{
+                                pd,
+                                wl_pointer_event_frame_types::Axes{}
+                            }
+                        ).info
+                    );
+
+                if (result == nullptr)
+                    MY_LOG_ERROR("The wl_pointer frame already contains a non axis-like event. Skipping this ", eventName, ".");
+
+                return result;
+            }
+        } pdListener{ appCtx, contentState };
 
         inputDevicesListener.addPointingDevAttachedEventListener([&appCtx, &pdListener] {
             appCtx.pointingDev.wlDevice = makeWLResourceWrapperChecked(
