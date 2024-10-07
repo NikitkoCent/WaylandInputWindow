@@ -1579,6 +1579,51 @@ int main(int, char*[])
         } mainWindowRedrawHintListener{ appCtx };
 
         // ============================================== END of Step N ===============================================
+
+        // ========================================= Step N+1: the event loop =========================================
+        appCtx.mainWindow.pendingBufferIdx = 0;
+
+        ContentState lastRenderedState = contentState;
+
+        while (!appCtx.shouldExit)
+        {
+            const bool contentHasChanged = (contentState != lastRenderedState);
+            if ( (appCtx.mainWindow.mustBeRedrawn || contentHasChanged) && appCtx.mainWindow.readyToBeRedrawn)
+            {
+                MY_LOG_TRACE("Redrawing the main window (appCtx.mainWindow.mustBeRedrawn=", appCtx.mainWindow.mustBeRedrawn, ", contentHasChanged=", contentHasChanged, ")...");
+
+                appCtx.mainWindow.mustBeRedrawn = false;
+
+                // Installing a new wl_surface::frame listener
+                appCtx.mainWindow.readyToBeRedrawn = false;
+                mainWindowRedrawHintListener.pendingCallback = MY_LOG_WLCALL(wl_surface_frame(*appCtx.mainWindow.surface));
+                if (mainWindowRedrawHintListener.pendingCallback == nullptr)
+                    throw std::system_error{errno, std::system_category(), "Failed to obtain a wl_surface::frame callback for the main window"};
+                if (const auto err = MY_LOG_WLCALL(wl_callback_add_listener(mainWindowRedrawHintListener.pendingCallback, &mainWindowRedrawHintListener.wlHandler, &mainWindowRedrawHintListener)); err != 0)
+                    throw std::system_error(
+                        errno,
+                        std::system_category(),
+                        "Failed to set the main window wl_surface::frame callback listener (wl_callback_add_listener returned " + std::to_string(err) + ")"
+                    );
+
+                // Rendering to the pending pixel buffer
+                renderMainWindow(appCtx, contentState);
+                // Attaching the pending pixel buffer to the surface
+                MY_LOG_WLCALL_VALUELESS(wl_surface_attach(*appCtx.mainWindow.surface, appCtx.mainWindow.getPendingWLSideBuffer(), 0, 0));
+                // Letting the server know that it should re-render the whole buffer
+                MY_LOG_WLCALL_VALUELESS(wl_surface_damage_buffer(*appCtx.mainWindow.surface, 0, 0, appCtx.mainWindow.width, appCtx.mainWindow.height));
+                // Commiting the current state of the main window (including the buffer content) so the server can now apply it
+                MY_LOG_WLCALL_VALUELESS(wl_surface_commit(*appCtx.mainWindow.surface));
+
+                appCtx.mainWindow.pendingBufferIdx = (appCtx.mainWindow.pendingBufferIdx + 1) % 2;
+
+                lastRenderedState = contentState;
+            }
+
+            appCtx.shouldExit = appCtx.shouldExit ||
+                (MY_LOG_WLCALL(wl_display_dispatch(*appCtx.connection)) == -1);
+        }
+        // ============================================= END of Step N+1 ==============================================
     }
     catch (const std::system_error& err)
     {
