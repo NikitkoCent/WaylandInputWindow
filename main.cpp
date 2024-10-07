@@ -1390,6 +1390,195 @@ int main(int, char*[])
                 };
         });
         // ============================================== END of Step 8 ===============================================
+
+        // === Step N: install listeners to all the Wayland objects (to handle errors and other important messages) ===
+
+        // 1. wl_display
+        struct ConnectionListener
+        {
+            WLAppCtx& appCtx;
+            const wl_display_listener wlHandler = { &onError, &onDeleteId };
+
+            static void onError(void* self, wl_display* /*connection*/, void* object_id, uint32_t code, const char* message)
+            {
+                MY_LOG_ERROR("A fatal wl_display error occurred: object_id=", object_id, " , code=", code, " , message=\"", message, "\"");
+
+                static_cast<ConnectionListener*>(self)->appCtx.shouldExit = true;
+            }
+
+            static void onDeleteId(void* /*self*/, wl_display* /*connection*/, uint32_t /*id*/) {}
+        } connectionListener{ appCtx } ;
+        if (const auto err = MY_LOG_WLCALL(wl_display_add_listener(*appCtx.connection, &connectionListener.wlHandler, &connectionListener)); err != 0)
+        {
+            const std::error_code sysErr{errno, std::system_category()};
+            MY_LOG_ERROR("Failed to set the connection listener: wl_display_add_listener returned ", err, " (errno=", sysErr, " \"", sysErr.message(), "\").");
+        }
+
+        // 2. wl_compositor doesn't have events yet
+
+        // 3. wl_shm only emits wl_shm_format events currently, which aren't interesting at the moment
+
+        // 4. xdg_wm_base
+        struct XdgShellListener
+        {
+            WLAppCtx& appCtx;
+            const xdg_wm_base_listener wlHandler = { &onPing };
+
+            static void onPing(void * const self, xdg_wm_base * const xdgShell, const uint32_t serial)
+            {
+                MY_LOG_TRACE("xdgShellListener::onPing(self=", self, ", xdgShell=", xdgShell, ", serial=", serial, ").");
+
+                if (*static_cast<XdgShellListener*>(self)->appCtx.xdgShell != xdgShell)
+                {
+                    MY_LOG_ERROR("xdgShellListener::onPing: appCtx.xdgShell != xdgShell");
+                    return;
+                }
+
+                MY_LOG_WLCALL_VALUELESS(xdg_wm_base_pong(xdgShell, serial));
+            }
+        } xdgShellListener{ appCtx };
+        if (const auto err = MY_LOG_WLCALL(xdg_wm_base_add_listener(*appCtx.xdgShell, &xdgShellListener.wlHandler, &xdgShellListener)); err != 0)
+            throw std::system_error(
+                errno,
+                std::system_category(),
+                "Failed to set the XDG shell listener (xdg_wm_base_add_listener returned " + std::to_string(err) + ")"
+            );
+
+        // 5. wl_shm_pool doesn't have events yet
+
+        // 6. wl_buffer only emits wl_buffer_release events currently, which aren't interesting at the moment
+
+        // 7. wl_surface + xdg_surface + xdg_toplevel (of the main window)
+        struct MainWindowSurfaceListener
+        {
+            WLAppCtx& appCtx;
+
+
+            const wl_surface_listener wlHandlerSurface = {
+                &onSurfaceEnterOutput,
+                &onSurfaceLeaveOutput/*,
+                    These are only supported since version 6 of the protocol
+                &onSurfacePreferredBufferScale,
+                &onSurfacePreferredBufferTransform*/
+            };
+
+            static void onSurfaceEnterOutput(void * const self, wl_surface * const surface, wl_output * const output)
+            {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onSurfaceEnterOutput(self=", self, ", ",
+                                                                             "surface=", surface, ", ",
+                                                                             "output=", output,
+                                                                             ").");
+            }
+
+            static void onSurfaceLeaveOutput(void * const self, wl_surface * const surface, wl_output * const output)
+            {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onSurfaceLeaveOutput(self=", self, ", ",
+                                                                             "surface=", surface, ", ",
+                                                                             "output=", output,
+                                                                             ").");
+            }
+
+            /* These are only supported since version 6 of the protocol
+            static void onSurfacePreferredBufferScale(void * const self, wl_surface * const surface, const int factor);
+            static void onSurfacePreferredBufferTransform(void * const self, wl_surface * const surface, const wl_output_transform transform);
+            */
+
+
+            const xdg_surface_listener wlHandlerXdgSurface = { &onXdgSurfaceConfigure };
+
+            static void onXdgSurfaceConfigure(void * const self, xdg_surface * const xdgSurface, const uint32_t serial)
+            {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onXdgSurfaceConfigure(self=", self, ", ",
+                                                                              "xdgSurface=", xdgSurface, ", ",
+                                                                              "serial=", serial,
+                                                                              ").");
+
+                // TODO: handle all the kinds of configure events and send 'ack_configure' requests back
+            }
+
+
+            const xdg_toplevel_listener wlHandlerXdgToplevel = {
+                &onXdgTopLevelConfigure,
+                &onXdgTopLevelClose,
+                &onXdgTopLevelConfigureBounds
+            };
+
+            static void onXdgTopLevelConfigure(
+                void * const self,
+                xdg_toplevel * const xdgToplevel,
+                const int32_t width,
+                const int32_t height,
+                wl_array * const states
+            ) {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onXdgTopLevelConfigure(self=", self, ", ",
+                                                                               "xdgToplevel=", xdgToplevel, ", ",
+                                                                               "width=", width, ", ",
+                                                                               "height=", height, ", ",
+                                                                               "states=", states,
+                                                                               ").");
+            }
+
+            static void onXdgTopLevelClose(void * const self, xdg_toplevel * const xdgToplevel)
+            {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onXdgTopLevelClose(self=", self, ", ",
+                                                                           "xdgToplevel=", xdgToplevel,
+                                                                           ").");
+                static_cast<MainWindowSurfaceListener*>(self)->appCtx.shouldExit = true;
+            }
+
+            static void onXdgTopLevelConfigureBounds(
+                void * const self,
+                xdg_toplevel * const xdgToplevel,
+                const int32_t width,
+                const int32_t height
+            ) {
+                MY_LOG_TRACE("mainWindowSurfaceListener::onXdgTopLevelConfigureBounds(self=", self, ", ",
+                                                                                     "xdgToplevel=", xdgToplevel, ", ",
+                                                                                     "width=", width, ", ",
+                                                                                     "height=", height,
+                                                                                     ").");
+            }
+        } mainWindowSurfaceListener{ appCtx };
+        if (const auto err = MY_LOG_WLCALL(wl_surface_add_listener(*appCtx.mainWindow.surface, &mainWindowSurfaceListener.wlHandlerSurface, &mainWindowSurfaceListener)); err != 0)
+            throw std::system_error(
+                errno,
+                std::system_category(),
+                "Failed to set the main window surface listener (wl_surface_add_listener returned " + std::to_string(err) + ")"
+            );
+        if (const auto err = MY_LOG_WLCALL(xdg_surface_add_listener(*appCtx.mainWindow.xdgSurface, &mainWindowSurfaceListener.wlHandlerXdgSurface, &mainWindowSurfaceListener)); err != 0)
+            throw std::system_error(
+                errno,
+                std::system_category(),
+                "Failed to set the main window XDG surface listener (xdg_surface_add_listener returned " + std::to_string(err) + ")"
+            );
+        if (const auto err = MY_LOG_WLCALL(xdg_toplevel_add_listener(*appCtx.mainWindow.xdgToplevel, &mainWindowSurfaceListener.wlHandlerXdgToplevel, &mainWindowSurfaceListener)); err != 0)
+            throw std::system_error(
+                errno,
+                std::system_category(),
+                "Failed to set the main window XDG surface listener (xdg_toplevel_add_listener returned " + std::to_string(err) + ")"
+            );
+
+        // The listener of wl_surface::frame callback
+        struct MainWindowRedrawHintListener
+        {
+            WLAppCtx& appCtx;
+            const wl_callback_listener wlHandler = { &onSurfaceFrame };
+            wl_callback* pendingCallback = nullptr;
+
+            static void onSurfaceFrame(void * const selfP, wl_callback * const callback, uint32_t /*timestampMs*/)
+            {
+                auto& self = *static_cast<MainWindowRedrawHintListener*>(selfP);
+
+                if (callback == self.pendingCallback)
+                {
+                    // callback will be destroyed by the compositor
+                    self.appCtx.mainWindow.readyToBeRedrawn = true;
+                    self.pendingCallback = nullptr;
+                }
+            }
+        } mainWindowRedrawHintListener{ appCtx };
+
+        // ============================================== END of Step N ===============================================
     }
     catch (const std::system_error& err)
     {
