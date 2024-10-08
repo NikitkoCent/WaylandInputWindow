@@ -18,6 +18,8 @@ find_package(Wayland REQUIRED
 )
 get_target_property(WaylandScannerPath Wayland::Scanner LOCATION)
 
+# TODO: find libxkbcommon
+
 
 # ============================ Generating sources for the used Wayland extension protocols ============================
 if (EXISTS "${Wayland_Protocols_DIR}/stable/xdg-shell/xdg-shell.xml")
@@ -86,4 +88,6 @@ target_link_libraries(WaylandInputWindow
     PRIVATE Threads::Threads
     PRIVATE Wayland::Client
     PRIVATE WaylandExXdgShell
+    # TODO: find the library first
+    PRIVATE xkbcommon
 )

@@ -2,6 +2,8 @@
 #include <wayland-client.h>          // wl_*
 #include <xdg-shell.h>               // xdg_*
 #include <linux/input-event-codes.h> // BTN_*
+#include <xkbcommon/xkbcommon.h>     // xkb_*
+#include <sys/mman.h>                // mmap, munmap
 #include <cstdint>                   // std::int*_t, std::uint*_t
 #include <string>                    // std::string
 #include <string_view>               // std::string_view
@@ -12,6 +14,7 @@
 #include <utility>                   // std::move
 #include <limits>                    // std::numeric_limits
 #include <bitset>                    // std::bitset
+#include <memory>                    // std::shared_ptr
 
 
 namespace wl_pointer_event_frame_types
@@ -186,6 +189,24 @@ struct WLAppCtx
     struct
     {
         WLResourceWrapper<wl_keyboard*> wlDevice;
+
+        // Currently the libxkbcommon is the only supported way to work with keyboard input
+        struct
+        {
+            std::shared_ptr<xkb_context> context;
+            std::shared_ptr<xkb_keymap> keymap;
+            std::shared_ptr<xkb_state> state;
+        } xkb;
+
+        struct
+        { // TODO: implement key repeating using this info
+            /// the rate of repeating keys in characters per second. Zero should disable any repeating
+            uint32_t rate = 0;
+            /// delay in milliseconds since key down until repeating starts
+            uint32_t delay = 0;
+        } repeatInfo;
+
+        uint32_t lastSerial = 0;
     } keyboard;
 
     struct PointingDevice
@@ -244,7 +265,11 @@ struct WLAppCtx
 
         touchScreen.wlDevice.reset();
         pointingDev.wlDevice.reset();
+
         keyboard.wlDevice.reset();
+        keyboard.xkb.state.reset();
+        keyboard.xkb.keymap.reset();
+        keyboard.xkb.context.reset();
 
         mainWindow.xdgToplevel.reset();
         mainWindow.xdgSurface.reset();
@@ -1390,6 +1415,250 @@ int main(int, char*[])
                 };
         });
         // ============================================== END of Step 8 ===============================================
+
+        // =========================== Step 9: handling keyboard input (excl. input methods) ==========================
+        { // initializing appCtx.keyboard.xkb.context
+            auto* xkbContext = MY_LOG_WLCALL(xkb_context_new(XKB_CONTEXT_NO_FLAGS));
+            if (xkbContext == nullptr)
+                throw std::system_error{errno, std::generic_category(), "Failed to create an xkb_context"};
+            appCtx.keyboard.xkb.context.reset(
+                xkbContext,
+                [](auto& xkbContext) { MY_LOG_WLCALL_VALUELESS(xkb_context_unref(xkbContext)); xkbContext = nullptr; }
+            );
+        }
+
+        struct KeyboardListener
+        {
+            WLAppCtx& appCtx;
+
+            const wl_keyboard_listener wlHandler = {
+                &onKeymap,
+                &onEnter,
+                &onLeave,
+                &onKey,
+                &onModifiers,
+                &onRepeatInfo
+            };
+
+        private: // wlHandler's callbacks
+            static void onKeymap(
+                void * const selfP,
+                wl_keyboard * const kb,
+                const uint32_t format,
+                const int32_t fd,
+                const uint32_t sizeBytes
+            ) {
+                MY_LOG_TRACE("kbListener::onKeymap(selfP=", selfP, ", kb=", kb, ", format=", format, ", fd=", fd, ", size=", sizeBytes, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+
+                // wl_keyboard::keymap informs how hardware-dependent keyboard scancodes translate to virtual key codes and
+                //     which characters should be produced (if any).
+                // The keymap info isn't sent directly, but transferred through the file descriptor `fd`.
+
+                if (self.appCtx.keyboard.xkb.context == nullptr)
+                    throw std::logic_error{"wl_keyboard::keymap: xkb_context is nullptr"};
+
+                self.appCtx.keyboard.xkb.state.reset();
+                self.appCtx.keyboard.xkb.keymap.reset();
+
+                if (format != wl_keyboard_keymap_format::WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
+                {
+                    MY_LOG_ERROR("wl_keyboard::keymap: unsupported keymap format: ", format);
+                    return;
+                }
+
+                char* keymapData = static_cast<char*>(mmap(nullptr, sizeBytes, PROT_READ, MAP_PRIVATE, fd, 0));
+                if (keymapData == MAP_FAILED)
+                {
+                    MY_LOG_ERROR("wl_keyboard::keymap: mmap failed (errno=", errno, ").");
+                    return;
+                }
+
+                // Creating new xkb_keymap
+
+                // WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 means that the `fd` contains a libxkbcommon compatible, null-terminated string
+                auto* const newKeymap = xkb_keymap_new_from_string(
+                    self.appCtx.keyboard.xkb.context.get(),
+                    keymapData,
+                    XKB_KEYMAP_FORMAT_TEXT_V1,
+                    XKB_KEYMAP_COMPILE_NO_FLAGS
+                );
+
+                if (const auto err = munmap(keymapData, sizeBytes); err != 0)
+                    MY_LOG_WARN("wl_keyboard::keymap: munmap failed (returned ", err, " , errno=", errno, ").");
+                keymapData = nullptr;
+
+                if (newKeymap == nullptr)
+                {
+                    MY_LOG_ERROR("wl_keyboard::keymap: failed to create a new xkb_keymap.");
+                    return;
+                }
+                self.appCtx.keyboard.xkb.keymap.reset(
+                    newKeymap,
+                    [](auto& keymap) { MY_LOG_WLCALL_VALUELESS(xkb_keymap_unref(keymap)); keymap = nullptr; }
+                );
+
+                // Creating new xkb_state
+
+                auto* const newState = xkb_state_new(newKeymap);
+                if (newState == nullptr)
+                {
+                    MY_LOG_ERROR("wl_keyboard::keymap: failed to create a new xkb_state");
+                    return;
+                }
+                self.appCtx.keyboard.xkb.state.reset(
+                    newState,
+                    [](auto& state) { MY_LOG_WLCALL_VALUELESS(xkb_state_unref(state)); state = nullptr; }
+                );
+            }
+
+            static void onEnter(
+                void * const selfP,
+                wl_keyboard * const kb,
+                const uint32_t serial,
+                wl_surface * const surface,
+                wl_array * const keys
+            ) {
+                MY_LOG_TRACE("kbListener::onEnter(selfP=", selfP, ", kb=", kb, ", serial=", serial, ", surface=", surface, ", keys=", keys, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+                if (self.appCtx.mainWindow.surface != surface)
+                {
+                    MY_LOG_WARN("wl_keyboard::enter: unexpected wl_surface=", surface, " != ", self.appCtx.mainWindow.surface.getResource(), ". Skipped.");
+                    return;
+                }
+                self.appCtx.keyboard.lastSerial = serial;
+            }
+
+            static void onLeave(
+                void * const selfP,
+                wl_keyboard * const kb,
+                const uint32_t serial,
+                wl_surface * const surface
+            ) {
+                MY_LOG_TRACE("kbListener::onLeave(selfP=", selfP, ", kb=", kb, ", serial=", serial, ", surface=", surface, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+                if (self.appCtx.mainWindow.surface != surface)
+                {
+                    MY_LOG_WARN("wl_keyboard::enter: unexpected wl_surface=", surface, " != ", self.appCtx.mainWindow.surface.getResource(), ". Skipped.");
+                    return;
+                }
+                self.appCtx.keyboard.lastSerial = serial;
+            }
+
+            static void onKey(
+                void * const selfP,
+                wl_keyboard * const kb,
+                const uint32_t serial,
+                const uint32_t time,
+                const uint32_t keyScancode,
+                const uint32_t state
+            ) {
+                MY_LOG_TRACE("kbListener::onKey(selfP=", selfP, ", kb=", kb, ", serial=", serial, ", time=", time, ", keyScancode=", keyScancode, ", state=", state, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+                self.appCtx.keyboard.lastSerial = serial;
+
+                // "to determine the xkb keycode, clients must add 8 to the key event keycode"
+                const xkb_keycode_t xkbKeycode = keyScancode + 8;
+
+                // TODO: log verbose information about key events
+                // TODO: modify the ContentState in response to key events
+                // TODO: make the app shut down in response to a key press
+
+                if (state == wl_keyboard_key_state::WL_KEYBOARD_KEY_STATE_PRESSED)
+                {
+                    const xkb_keysym_t xkbKeysym = MY_LOG_WLCALL(xkb_state_key_get_one_sym(self.appCtx.keyboard.xkb.state.get(), xkbKeycode));
+
+                    MY_LOG_INFO("wl_keyboard::key: key pressed (XKB keycode=", xkbKeycode, " , XKB keysym=", xkbKeysym, ").");
+                }
+                else if (state == wl_keyboard_key_state::WL_KEYBOARD_KEY_STATE_RELEASED)
+                {
+                }
+                else
+                {
+                    MY_LOG_ERROR("wl_keyboard::key: unknown key state=", state);
+                    return;
+                }
+            }
+
+            static void onModifiers(
+                void * const selfP,
+                wl_keyboard * const kb,
+                const uint32_t serial,
+                const uint32_t modsDepressed,
+                const uint32_t modsLatched,
+                const uint32_t modsLocked,
+                const uint32_t group
+            ) {
+                MY_LOG_TRACE("kbListener::onModifiers(selfP=", selfP, ", kb=", kb, ", serial=", serial, ", modsDepressed=", modsDepressed, ", modsLatched=", modsLatched, ", modsLocked=", modsLocked, ", group=", group, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+                if (self.appCtx.keyboard.wlDevice != kb)
+                {
+                    MY_LOG_WARN("wl_keyboard::modifiers: unexpected wl_keyboard=", kb, " != ", self.appCtx.keyboard.wlDevice.getResource(), ". Skipped.");
+                    return;
+                }
+                self.appCtx.keyboard.lastSerial = serial;
+
+                const xkb_state_component state = MY_LOG_WLCALL(xkb_state_update_mask(
+                    self.appCtx.keyboard.xkb.state.get(),
+                    modsDepressed,
+                    modsLatched,
+                    modsLocked,
+                    0,
+                    0,
+                    group
+                ));
+                (void)state;
+
+                // TODO: log information about pressed/release modifiers and when the current keyboard layout is changed
+            }
+
+            static void onRepeatInfo(
+                [[maybe_unused]] void * const selfP,
+                [[maybe_unused]] wl_keyboard * const kb,
+                [[maybe_unused]] const int32_t rate,
+                [[maybe_unused]] const int32_t delay
+            ) {
+                MY_LOG_TRACE("kbListener::onRepeatInfo(selfP=", selfP, ", kb=", kb, ", rate=", rate, ", delay=", delay, ").");
+
+                auto& self = *static_cast<KeyboardListener*>(selfP);
+                if (self.appCtx.keyboard.wlDevice != kb)
+                {
+                    MY_LOG_WARN("wl_keyboard::repeat_info: unexpected wl_keyboard=", kb, " != ", self.appCtx.keyboard.wlDevice.getResource(), ". Skipped.");
+                    return;
+                }
+
+                self.appCtx.keyboard.repeatInfo.rate = rate;
+                self.appCtx.keyboard.repeatInfo.delay = delay;
+            }
+        } kbListener{ appCtx };
+
+        inputDevicesListener.addKeyboardAttachedEventListener([&appCtx, &kbListener] {
+            // TODO: handle the cases when a keyboard is dynamically attached/detached
+
+            appCtx.keyboard.wlDevice = makeWLResourceWrapperChecked(
+                MY_LOG_WLCALL(wl_seat_get_keyboard(*appCtx.inputDevicesManager)),
+                nullptr,
+                [](auto& kb) { MY_LOG_WLCALL_VALUELESS(wl_keyboard_release(kb)); kb = nullptr; }
+            );
+            if (!appCtx.keyboard.wlDevice.hasResource())
+                throw std::system_error{errno, std::system_category(), "Failed to obtain a keyboard (wl_keyboard), although it had been available"};
+
+            if (const auto err = MY_LOG_WLCALL(wl_keyboard_add_listener(*appCtx.keyboard.wlDevice, &kbListener.wlHandler, &kbListener)); err != 0)
+                throw std::system_error{
+                    errno,
+                    std::system_category(),
+                    "Failed to set the keyboard listener (wl_keyboard_add_listener returned " + std::to_string(err) + ")"
+                };
+
+            appCtx.keyboard.repeatInfo.rate = 0;
+            appCtx.keyboard.repeatInfo.delay = 0;
+        });
+        // ============================================== END of Step 9 ===============================================
 
         // === Step N: install listeners to all the Wayland objects (to handle errors and other important messages) ===
 
